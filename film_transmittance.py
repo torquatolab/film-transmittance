@@ -355,7 +355,16 @@ def main(args):
 			comps_ = args.comp if args.JouleHeating == False else ['Ex','Ey','Ez',"Dx","Dy", "Dz"]
 			comps = [component_map[c] for c in comps_]
 
-			dft_field = sim.add_dft_fields(comps, fcen, fwidth, NumFreqs, where=nonpml_vol, yee_grid=False) if args.JouleHeating else sim.add_dft_fields(comps, fcen, fwidth, NumFreqs, where=nonpml_vol) 
+			# Volume DFT: every -nfreqs bin (default), only the -field_wavelengths
+			# frequencies, or none at all (-no_fields).  Without it the DFT-decay stopping
+			# condition sees only the flux monitors; with a frequency subset Meep's
+			# automatic decimation (from the largest monitored frequency) can differ.
+			if args.no_fields:
+				dft_field = None
+			elif args.field_wavelengths:
+				dft_field = sim.add_dft_fields(comps, [1.0/wl_ for wl_ in args.field_wavelengths], where=nonpml_vol)
+			else:
+				dft_field = sim.add_dft_fields(comps, fcen, fwidth, NumFreqs, where=nonpml_vol, yee_grid=False) if args.JouleHeating else sim.add_dft_fields(comps, fcen, fwidth, NumFreqs, where=nonpml_vol) 
 			
 			# Use provided tempname; otherwise, fall back to basename of saveas
 			temp_name = args.tempname if args.tempname != "" else args.saveas.split('/')[-1]
@@ -683,12 +692,23 @@ def main(args):
 				
 			else: 
 				# write dft fields 
-				print("saving dft files...\n")
 				Absorption = np.zeros(NumFreqs)
 				_dft_ok = True
-				for i in range(NumFreqs):
-					k_exact = kmin + (kmax-kmin)*i/(NumFreqs-1)
-					k_i = np.round(k_exact*10000)/10000   # file names only
+				# (DFT bin, k for the file name, exact k) of every volume-DFT bin to save
+				if args.no_fields:
+					print("-no_fields: no dft files\n")
+					field_bins = []
+				elif args.field_wavelengths:
+					print("saving dft files (-field_wavelengths)...\n")
+					field_bins = [(j, round(2.0*np.pi/wl_, 4), 2.0*np.pi/wl_)
+								  for j, wl_ in enumerate(args.field_wavelengths)]
+				else:
+					print("saving dft files...\n")
+					field_bins = [(i, None, kmin + (kmax-kmin)*i/(NumFreqs-1))
+								  for i in range(NumFreqs)]
+				for i, k_i, k_exact in field_bins:
+					if k_i is None:
+						k_i = np.round(k_exact*10000)/10000   # file names only
 					name = "{0}__ka-{1:.04f}-{2}.npy"
 
 					# store relevant field components
@@ -837,7 +857,36 @@ if __name__ == '__main__':
 
 	parser.add_argument('-particle', type=str, default='disk', help='particle shape')
 
+	# --- field output (P4) ---
+	parser.add_argument('-no_fields', action='store_true', default=False,
+		help='skip the volume DFT: no __ka-* field arrays are written (the _x/_y/_z/_w '
+			 'metadata and the T/R table still are); needs -ScattPower')
+	parser.add_argument('-field_wavelengths', type=float, nargs='+', default=None,
+		help='volume DFT only at these wavelengths (um), freq = 1/lambda exactly; files '
+			 'are named __ka-{round(2*pi/lambda, 4)}')
+	# --- end field output (P4) ---
+
 	args = parser.parse_args()
+	# --- field output (P4) ---
+	# Rejected before main() builds the simulation.
+	if args.no_fields and args.field_wavelengths:
+		raise SystemExit("-no_fields and -field_wavelengths are mutually exclusive")
+	if args.JouleHeating and (args.no_fields or args.field_wavelengths):
+		raise SystemExit("-JouleHeating needs the full volume DFT; it cannot be combined "
+			"with {0}".format("-no_fields" if args.no_fields else "-field_wavelengths"))
+	if args.no_fields and not args.ScattPower:
+		# No DFT object at all: nothing would be computed, and Meep's DFT-decay stopping
+		# condition divides by the (zero) maximum DFT frequency.
+		raise SystemExit("-no_fields requires -ScattPower (otherwise nothing is computed)")
+	if args.field_wavelengths:
+		if not all(np.isfinite(wl_) and wl_ > 0 for wl_ in args.field_wavelengths):
+			raise SystemExit("-field_wavelengths must be finite and positive (got {0})".format(
+				args.field_wavelengths))
+		_knames = ["{0:.4f}".format(round(2.0*np.pi/wl_, 4)) for wl_ in args.field_wavelengths]
+		if len(set(_knames)) != len(_knames):
+			raise SystemExit("-field_wavelengths {0} give duplicate file names ka-{1}".format(
+				args.field_wavelengths, _knames))
+	# --- end field output (P4) ---
 	# Cheap argument checks, all before main() spends time building the simulation.
 	if args.Z2:
 		raise SystemExit("-Z2 is not implemented in this script; pass a -load file")
