@@ -1,0 +1,768 @@
+--- a/src/meep.hpp
++++ b/src/meep.hpp
+@@ -218,6 +218,26 @@
+     (void)start;
+   }
+   virtual int get_num_params() { return 0; }
++
++  /* Flat view of the internal data, used by fields::dump/load to checkpoint
++     dispersive (e.g. metallic) media.  Every internal-data layout is a header
++     followed by a single contiguous realnum block; only that block is state,
++     since the pointers into it are rebuilt by init_internal_data() when the
++     fields are reconstructed from the dumped structure.  num_internal_data
++     returns the block length in realnums (0 if this chunk needs no P), and
++     internal_data_ptr returns its start.  The default aborts rather than
++     silently checkpointing a subclass whose state it cannot see. */
++  virtual size_t num_internal_data(void *data) const;
++  virtual realnum *internal_data_ptr(void *data) const {
++    (void)data;
++    return NULL;
++  }
++
++  /* Can this susceptibility's state survive a checkpoint at all?  Asked BEFORE any
++     file is opened and independently of whether P has been allocated yet, so an
++     unsupported material refuses without first truncating an existing checkpoint.
++     Defaults to false: a subclass whose state we cannot see must not be dumped. */
++  virtual bool supports_checkpoint() const { return false; }
+   // This should only be used when dumping and loading susceptibility data to hdf5
+   void set_id(int new_id) { id = new_id; };
+ 
+@@ -269,6 +289,10 @@
+   virtual realnum *cinternal_notowned_ptr(int inotowned, component c, int cmp, int n,
+                                           void *P_internal_data) const;
+ 
++  virtual size_t num_internal_data(void *data) const;
++  virtual realnum *internal_data_ptr(void *data) const;
++  virtual bool supports_checkpoint() const { return true; }
++
+   virtual void dump_params(h5file *h5f, size_t *start);
+   virtual int get_num_params() { return 4; }
+ 
+@@ -291,6 +315,14 @@
+                         realnum *W_prev[NUM_FIELD_COMPONENTS][2], realnum dt, const grid_volume &gv,
+                         void *P_internal_data) const;
+ 
++  /* Deliberately NOT checkpointable: update_P draws from gaussian_random, whose
++     MT19937 state is static in src/support/mt19937ar.c and therefore outside the
++     internal-data block.  Restoring P alone would resume with a different noise
++     stream while looking like a faithful restart, so abort instead -- which is what
++     stock meep does for every dispersive material anyway. */
++  virtual size_t num_internal_data(void *data) const;
++  virtual bool supports_checkpoint() const { return false; }
++
+   virtual void dump_params(h5file *h5f, size_t *start);
+   virtual int get_num_params() { return 5; }
+ 
+@@ -323,6 +355,10 @@
+   virtual realnum *cinternal_notowned_ptr(int inotowned, component c, int cmp, int n,
+                                           void *P_internal_data) const;
+ 
++  virtual size_t num_internal_data(void *data) const;
++  virtual realnum *internal_data_ptr(void *data) const;
++  virtual bool supports_checkpoint() const { return true; }
++
+   virtual void dump_params(h5file *h5f, size_t *start);
+   virtual int get_num_params() { return 8; }
+   virtual bool needs_W_notowned(component c, realnum *W[NUM_FIELD_COMPONENTS][2]) const {
+@@ -2290,6 +2326,10 @@
+                                const std::string &field_name, FieldPtrGetter field_ptr_getter);
+   void load_fields_chunk_field(h5file *h5f, bool single_parallel_file,
+                                const std::string &field_name, FieldPtrGetter field_ptr_getter);
++  // Helper methods for the internal polarization state of dispersive media.
++  void dump_polarizations(h5file *h5f, bool single_parallel_file);
++  void load_polarizations(h5file *h5f, bool single_parallel_file);
++  void assert_checkpointable();
+ 
+ public:
+   // monitor.cpp
+--- a/src/susceptibility.cpp
++++ b/src/susceptibility.cpp
+@@ -63,6 +63,11 @@
+ 
+ void susceptibility::delete_internal_data(void *data) const { free(data); }
+ 
++size_t susceptibility::num_internal_data(void *data) const {
++  if (data) meep::abort("susceptibility does not support fields::dump/load");
++  return 0;
++}
++
+ /* Return whether or not we need to allocate P[c][cmp].  (We don't need to
+    allocate P[c] if we can be sure it will be zero.)
+ 
+@@ -157,6 +162,31 @@
+   return (void *)dnew;
+ }
+ 
++/* Length in realnums of the trailing data[] block of an internal-data struct
++   allocated as sizeof(T) + sizeof(realnum) * (num - 1).  num == 0 (this chunk
++   needs no P for this susceptibility) makes that smaller than sizeof(T). */
++template <typename T> static size_t internal_data_num(const void *data) {
++  if (!data) return 0;
++  size_t sz = ((const T *)data)->sz_data;
++  return sz < sizeof(T) ? 0 : (sz - sizeof(T)) / sizeof(realnum) + 1;
++}
++
++size_t lorentzian_susceptibility::num_internal_data(void *data) const {
++  return internal_data_num<lorentzian_data>(data);
++}
++
++realnum *lorentzian_susceptibility::internal_data_ptr(void *data) const {
++  return data ? ((lorentzian_data *)data)->data : NULL;
++}
++
++size_t noisy_lorentzian_susceptibility::num_internal_data(void *data) const {
++  if (data)
++    meep::abort("noisy_lorentzian_susceptibility cannot be checkpointed: its MT19937 "
++                "noise state lives outside the polarization data, so a restart would "
++                "silently continue with a different noise stream");
++  return 0;
++}
++
+ #if 0
+ /* Return true if the discretized Lorentzian ODE is intrinsically unstable,
+    i.e. if it corresponds to a filter with a pole z outside the unit circle.
+@@ -432,6 +462,14 @@
+   return (void *)dnew;
+ }
+ 
++size_t gyrotropic_susceptibility::num_internal_data(void *data) const {
++  return internal_data_num<gyrotropy_data>(data);
++}
++
++realnum *gyrotropic_susceptibility::internal_data_ptr(void *data) const {
++  return data ? ((gyrotropy_data *)data)->data : NULL;
++}
++
+ bool gyrotropic_susceptibility::needs_P(component c, int cmp,
+                                         realnum *W[NUM_FIELD_COMPONENTS][2]) const {
+   if (!is_electric(c) && !is_magnetic(c)) return false;
+--- a/src/structure_dump.cpp
++++ b/src/structure_dump.cpp
+@@ -77,7 +77,7 @@
+     size_t gv_origins_start = 0;
+     file.write_chunk(1, &gv_origins_start, &sz, origins);
+   }
+-  file.create_data("gv_nums", 1, &sz);
++  file.create_data("gv_nums", 1, &sz, false /* append_data */, false /* single_precision */);
+   if (am_master()) {
+     size_t nums_start = 0;
+     file.write_chunk(1, &nums_start, &sz, nums);
+@@ -136,7 +136,9 @@
+   h5file file(filename, h5file::WRITE, single_parallel_file, !single_parallel_file);
+   size_t dims[3] = {(size_t)my_num_chunks, NUM_FIELD_COMPONENTS, 5};
+   size_t start[3] = {0, 0, 0};
+-  file.create_data("num_chi1inv", 3, dims);
++  // full precision: gv.ntot() exceeds float32's exact integer range for large 3D chunks
++  file.create_data("num_chi1inv", 3, dims, false /* append_data */,
++                   false /* single_precision */);
+   if (am_master() || !single_parallel_file) {
+     file.write_chunk(3, start, dims, num_chi1inv.data());
+   }
+@@ -171,7 +173,8 @@
+   {
+     // Write the number of susceptibilites
+     size_t len = 2;
+-    file.create_data("num_sus", 1, &len);
++    // full precision: a susceptibility-list length has no bound below 2^24
++    file.create_data("num_sus", 1, &len, false /* append_data */, false /* single_precision */);
+     if (am_master() || !single_parallel_file) {
+       size_t start = 0;
+       size_t ntot = 2;
+@@ -295,7 +298,10 @@
+           int d = sigma_cd[ft][j + 1];
+           snprintf(dname, 20, "%c_%d_sigma_%d_%d", ft == 0 ? 'E' : 'H', i, c, d);
+           size_t ntot = chunks[i]->gv.ntot() * num_sus[ft];
+-          file.create_data(dname, 1, &ntot);
++          // full precision, as for chi1inv: sigma is realnum (double by default),
++          // and truncating it to float perturbs every dispersive material
++          file.create_data(dname, 1, &ntot, false /* append_data */,
++                           false /* single_precision */);
+           if (chunks[i]->is_mine()) {
+             susceptibility *sus = chunks[i]->chiP[ft];
+             size_t start = 0;
+--- a/src/fields_dump.cpp
++++ b/src/fields_dump.cpp
+@@ -22,8 +22,10 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <stdint.h>
+ 
+ #include <cassert>
++#include <vector>
+ 
+ #include "meep.hpp"
+ #include "meep_internals.hpp"
+@@ -50,10 +52,6 @@
+   size_t my_ntot = 0;
+   for (int i = 0, chunk_i = 0; i < num_chunks; i++) {
+     if (chunks[i]->is_mine()) {
+-      FOR_FIELD_TYPES(ft) {
+-        if (chunks[i]->pol[ft] != NULL)
+-          meep::abort("non-null polarization_state in fields::dump (unsupported)");
+-      }
+       size_t ntot = chunks[i]->gv.ntot();
+       for (int c = 0; c < NUM_FIELD_COMPONENTS; ++c) {
+         for (int d = 0; d < 2; ++d) {
+@@ -83,7 +81,10 @@
+   size_t dims[3] = {(size_t)my_num_chunks, NUM_FIELD_COMPONENTS, 2};
+   size_t start[3] = {0, 0, 0};
+   std::string num_f_name = std::string("num_") + field_name;
+-  h5f->create_data(num_f_name.c_str(), 3, dims);
++  // full precision: these hold gv.ntot(), which exceeds float32's exact integer
++  // range (2^24) for a large 3D chunk and would then be silently rounded.
++  h5f->create_data(num_f_name.c_str(), 3, dims, false /* append_data */,
++                   false /* single_precision */);
+   if (am_master() || !single_parallel_file) { h5f->write_chunk(3, start, dims, num_f.data()); }
+ 
+   /* write the data */
+@@ -105,7 +106,498 @@
+   }
+ }
+ 
++/* fields_chunk::update_pols allocates the internal polarization data lazily, on
++   the first timestep.  A checkpoint can be written or read before that has
++   happened, so force the allocation here; init_internal_data zeroes it, which is
++   exactly the t=0 state.  Doing this symmetrically in dump and load keeps the
++   two sides agreeing on what is in the file.  Returns true if it allocated. */
++static bool alloc_pol_data(fields_chunk *fc) {
++  bool allocated = false;
++  FOR_FIELD_TYPES(ft) {
++    for (polarization_state *p = fc->pol[ft]; p; p = p->next) {
++      if (!p->data) {
++        p->data = p->s->new_internal_data(fc->f, fc->gv);
++        if (p->data) {
++          p->s->init_internal_data(fc->f, fc->dt, fc->gv, p->data);
++          allocated = true;
++        }
++      }
++    }
++  }
++  return allocated;
++}
++
++/* Total number of realnums of internal polarization (ADE auxiliary-field) state
++   held by one chunk.  Iteration order -- field type, then the pol linked list --
++   is the order in which fields_chunk builds pol[] from structure_chunk::chiP, so
++   it is reproduced exactly when the same structure is loaded back. */
++static size_t chunk_pol_ntot(fields_chunk *fc) {
++  size_t n = 0;
++  FOR_FIELD_TYPES(ft) {
++    for (polarization_state *p = fc->pol[ft]; p; p = p->next) {
++      if (p->data) n += p->s->num_internal_data(p->data);
++    }
++  }
++  return n;
++}
++
++/* Per-pole descriptor: two size_t per polarization, in the same iteration order as the
++   data itself -- {global chunk index, block length}.  This pins the per-pole
++   boundaries, which a per-chunk total does not: it catches a pole list whose blocks
++   are laid out differently, e.g. a gyrotropic pole (6*ntot) where a Lorentzian one
++   (2*ntot) was dumped.
++
++   It deliberately does NOT carry susceptibility::get_id(): that is a static counter
++   assigned at construction, so two poles built in swapped order receive the same ids
++   positionally and the check would pass anyway -- while a legitimate fields-only load
++   onto an independently rebuilt structure would get *different* ids and abort
++   spuriously.  Identity would need a content-derived fingerprint of the pole's
++   parameters, which the const susceptibility interface cannot currently supply.
++   Consequence, stated plainly: reordering two poles of EQUAL block size is not
++   detected.  Loading the structure from the same checkpoint (the supported flow)
++   makes that unreachable, since the pole list is then reconstructed from the file. */
++static void chunk_pol_desc(fields_chunk *fc, int chunk_index, std::vector<size_t> &out) {
++  FOR_FIELD_TYPES(ft) {
++    for (polarization_state *p = fc->pol[ft]; p; p = p->next) {
++      if (!p->data) continue;
++      size_t n = p->s->num_internal_data(p->data);
++      if (!n) continue;
++      out.push_back((size_t)chunk_index);
++      out.push_back(n);
++    }
++  }
++}
++
++/* Refuse unsupported materials BEFORE any file is opened or any field is restored.
++   Checking here rather than at the first num_internal_data() call matters: dump
++   truncates the target file and writes t and the field arrays before it reaches the
++   polarization pass, so a late abort would destroy a previously good checkpoint.
++   Collective: every process evaluates the same or_to_all, then all abort together. */
++void fields::assert_checkpointable() {
++  bool bad = false;
++  for (int i = 0; i < num_chunks; i++) {
++    if (!chunks[i]->is_mine()) continue;
++    FOR_FIELD_TYPES(ft) {
++      for (polarization_state *p = chunks[i]->pol[ft]; p; p = p->next)
++        if (p->s && !p->s->supports_checkpoint()) bad = true;
++    }
++  }
++  if (or_to_all(bad))
++    meep::abort("this simulation contains a susceptibility whose state cannot be "
++                "checkpointed (e.g. noisy_lorentzian_susceptibility, whose MT19937 "
++                "noise state lives outside the polarization data); refusing before "
++                "touching any file");
++}
++
++void fields::dump_polarizations(h5file *h5f, bool single_parallel_file) {
++  bool allocated = false;
++  for (int i = 0; i < num_chunks; i++) {
++    if (chunks[i]->is_mine()) allocated = alloc_pol_data(chunks[i]) || allocated;
++  }
++  // allocating P adds chunk-boundary communications for it (cf. fields::update_pols)
++  if (or_to_all(allocated)) chunk_connections_valid = false;
++
++  int my_num_chunks = 0;
++  for (int i = 0; i < num_chunks; i++) {
++    my_num_chunks += (single_parallel_file || chunks[i]->is_mine());
++  }
++
++  std::vector<size_t> num_p_(my_num_chunks, 0);
++  size_t my_ntot = 0;
++  for (int i = 0, chunk_i = 0; i < num_chunks; i++) {
++    if (chunks[i]->is_mine()) {
++      num_p_[chunk_i] = chunk_pol_ntot(chunks[i]);
++      my_ntot += num_p_[chunk_i];
++    }
++    chunk_i += (chunks[i]->is_mine() || single_parallel_file);
++  }
++
++  std::vector<size_t> num_p;
++  if (single_parallel_file) {
++    num_p.resize(my_num_chunks);
++    sum_to_master(num_p_.data(), num_p.data(), my_num_chunks);
++  }
++  else { num_p = std::move(num_p_); }
++
++  /* determine total dataset size and offset of this process's data */
++  size_t my_start = 0;
++  size_t ntotal = my_ntot;
++  if (single_parallel_file) {
++    my_start = partial_sum_to_all(my_ntot) - my_ntot;
++    ntotal = sum_to_all(my_ntot);
++  }
++
++  /* non-dispersive simulation: write nothing, so the file is unchanged */
++  if (ntotal == 0) return;
++
++  size_t dims[1] = {(size_t)my_num_chunks};
++  size_t start[1] = {0};
++  // full precision: a per-chunk block length exceeds float32's exact range (2^24)
++  // for a large 3D chunk, and would then be silently rounded.
++  h5f->create_data("num_pol", 1, dims, false /* append_data */, false /* single_precision */);
++  if (am_master() || !single_parallel_file) { h5f->write_chunk(1, start, dims, num_p.data()); }
++
++  /* descriptor table, laid out exactly like the data below */
++  std::vector<size_t> desc;
++  for (int i = 0; i < num_chunks; i++)
++    if (chunks[i]->is_mine()) chunk_pol_desc(chunks[i], i, desc);
++  size_t my_ndesc = desc.size();
++  size_t desc_start = 0;
++  size_t desc_total = my_ndesc;
++  if (single_parallel_file) {
++    desc_start = partial_sum_to_all(my_ndesc) - my_ndesc;
++    desc_total = sum_to_all(my_ndesc);
++  }
++  h5f->create_data("pol_desc", 1, &desc_total, false /* append_data */,
++                   false /* single_precision */);
++  if (my_ndesc) h5f->write_chunk(1, &desc_start, &my_ndesc, desc.data());
++
++  h5f->create_data("pol", 1, &ntotal, false /* append_data */, false /* single_precision */);
++  for (int i = 0; i < num_chunks; i++) {
++    if (chunks[i]->is_mine()) {
++      FOR_FIELD_TYPES(ft) {
++        for (polarization_state *p = chunks[i]->pol[ft]; p; p = p->next) {
++          if (!p->data) continue;
++          size_t n = p->s->num_internal_data(p->data);
++          if (n) {
++            h5f->write_chunk(1, &my_start, &n, p->s->internal_data_ptr(p->data));
++            my_start += n;
++          }
++        }
++      }
++    }
++  }
++}
++
++void fields::load_polarizations(h5file *h5f, bool single_parallel_file) {
++  bool allocated = false;
++  for (int i = 0; i < num_chunks; i++) {
++    if (chunks[i]->is_mine()) allocated = alloc_pol_data(chunks[i]) || allocated;
++  }
++  // allocating P adds chunk-boundary communications for it (cf. fields::update_pols)
++  if (or_to_all(allocated)) chunk_connections_valid = false;
++
++  int my_num_chunks = 0;
++  for (int i = 0; i < num_chunks; i++) {
++    my_num_chunks += (single_parallel_file || chunks[i]->is_mine());
++  }
++
++  /* The polarization data blocks are already allocated (fields_chunk built them
++     from the structure that was loaded first), so their sizes are known locally
++     and only have to be checked against the file. */
++  std::vector<size_t> expect(my_num_chunks, 0);
++  size_t my_ntot = 0;
++  for (int i = 0, chunk_i = 0; i < num_chunks; i++) {
++    if (chunks[i]->is_mine()) {
++      expect[chunk_i] = chunk_pol_ntot(chunks[i]);
++      my_ntot += expect[chunk_i];
++    }
++    chunk_i += (chunks[i]->is_mine() || single_parallel_file);
++  }
++
++  size_t my_start = 0;
++  size_t ntotal = my_ntot;
++  if (single_parallel_file) {
++    my_start = partial_sum_to_all(my_ntot) - my_ntot;
++    ntotal = sum_to_all(my_ntot);
++  }
++  if (ntotal == 0) return;
++
++  int rank;
++  size_t dims[1], start[1] = {0};
++  std::vector<size_t> num_p(my_num_chunks);
++  h5f->read_size("num_pol", &rank, dims, 1);
++  if (rank != 1 || dims[0] != (size_t)my_num_chunks)
++    meep::abort("chunk mismatch for 'num_pol' in fields::load");
++  if (am_master() || !single_parallel_file) h5f->read_chunk(1, start, dims, num_p.data());
++  if (single_parallel_file) {
++    h5f->prevent_deadlock();
++    broadcast(0, num_p.data(), dims[0]);
++  }
++  for (int i = 0, chunk_i = 0; i < num_chunks; i++) {
++    if (chunks[i]->is_mine() && num_p[chunk_i] != expect[chunk_i])
++      meep::abort("polarization size mismatch %zd vs %zd in fields::load", num_p[chunk_i],
++                  expect[chunk_i]);
++    chunk_i += (chunks[i]->is_mine() || single_parallel_file);
++  }
++
++  /* per-pole boundary check before any data is read: the descriptor pins each pole's
++     chunk and block length, so a pole list whose blocks are laid out differently
++     aborts instead of silently inheriting another pole's history.  It carries no
++     susceptibility id -- see chunk_pol_desc for why, and for what this does not
++     catch. */
++  std::vector<size_t> expect_desc;
++  for (int i = 0; i < num_chunks; i++)
++    if (chunks[i]->is_mine()) chunk_pol_desc(chunks[i], i, expect_desc);
++  size_t my_ndesc = expect_desc.size();
++  size_t desc_start = 0;
++  size_t desc_total = my_ndesc;
++  if (single_parallel_file) {
++    desc_start = partial_sum_to_all(my_ndesc) - my_ndesc;
++    desc_total = sum_to_all(my_ndesc);
++  }
++  h5f->read_size("pol_desc", &rank, dims, 1);
++  if (rank != 1 || dims[0] != desc_total)
++    meep::abort("polarization descriptor size mismatch %zu vs %zu in fields::load", dims[0],
++                desc_total);
++  if (my_ndesc) {
++    std::vector<size_t> file_desc(my_ndesc);
++    h5f->read_chunk(1, &desc_start, &my_ndesc, file_desc.data());
++    for (size_t k = 0; k < my_ndesc; k += 2) {
++      if (file_desc[k] != expect_desc[k] || file_desc[k + 1] != expect_desc[k + 1])
++        meep::abort("polarization %zu mismatch in fields::load: file has "
++                    "{chunk %zu, %zu values}, simulation has {chunk %zu, %zu values}",
++                    k / 2, file_desc[k], file_desc[k + 1], expect_desc[k], expect_desc[k + 1]);
++    }
++  }
++
++  h5f->read_size("pol", &rank, dims, 1);
++  if (rank != 1 || dims[0] != ntotal) {
++    meep::abort("inconsistent data size for 'pol' in fields::load (rank, dims[0]): "
++                "(%d, %zu) != (1, %zu)",
++                rank, dims[0], ntotal);
++  }
++  for (int i = 0; i < num_chunks; i++) {
++    if (chunks[i]->is_mine()) {
++      FOR_FIELD_TYPES(ft) {
++        for (polarization_state *p = chunks[i]->pol[ft]; p; p = p->next) {
++          if (!p->data) continue;
++          size_t n = p->s->num_internal_data(p->data);
++          if (n) {
++            h5f->read_chunk(1, &my_start, &n, p->s->internal_data_ptr(p->data));
++            my_start += n;
++          }
++        }
++      }
++    }
++  }
++}
++
++/* --- DFT chunks -------------------------------------------------------------
++   A dft_chunk is threaded onto TWO different lists: next_in_dft chains the chunks of
++   one DFT *object* across fields chunks, and next_in_chunk chains every DFT chunk
++   belonging to one *fields* chunk.  fields::dump/load iterate fields chunks, so they
++   must walk next_in_chunk.  The shared save_dft_hdf5/load_dft_hdf5 in dft.cpp walk
++   next_in_dft -- correct for their own caller (dft_flux::save_hdf5, which passes one
++   object's list) but wrong here: starting from fields_chunk::dft_chunks and following
++   next_in_dft leaves that fields chunk's *other* monitors untouched.  For an ordinary
++   flux monitor that saved E but not H, so the restored flux was identically zero
++   while the file looked populated.  These two helpers are the same routines walking
++   the correct link, and they store full precision to match the field arrays. */
++/* Seven size_t per dft_chunk: component, N, nfreq, then two 32-bit halves each of the
++   frequency signature and the geometry/update signature. */
++#define DFT_DESC_STRIDE 7
++
++/* Content signature of one dft_chunk: what the monitor IS and how it accumulates.
++   Unlike a susceptibility's counter id this is derived from the monitor's own
++   definition, so it distinguishes two monitors that merely hold the same number of
++   values.  Written as five size_t per chunk, in the same order as the data.
++
++   Two traps this code exists to avoid, both hit during development:
++     - h5file stores these size_t arrays through a floating-point dataset, so only
++       values below 2^53 survive exactly; each signature is therefore stored as two
++       32-bit halves (see split_sig), split only at the very END, never during mixing.
++     - Masking during mixing would make the result depend only on the low bits of each
++       input.  For an IEEE-754 double that is the mantissa, so w and 2*w -- same
++       mantissa, different exponent -- would collide. */
++/* The signature is stored as TWO words of 32 bits rather than one narrowed word.
++   Each half is <= 2^32-1, so it fits a size_t on a 32-bit target and is exact in the
++   binary64 dataset h5file writes these through -- and the full 64 bits of hash are
++   kept, instead of the 2^-31 collision bound a single narrowed word would impose. */
++static void split_sig(uint64_t h, std::vector<size_t> &out) {
++  out.push_back((size_t)(h & 0xFFFFFFFFULL));
++  out.push_back((size_t)((h >> 32) & 0xFFFFFFFFULL));
++}
++
++static uint64_t mix64(uint64_t h, uint64_t v) {
++  h ^= v;
++  h *= 0xff51afd7ed558ccdULL;
++  h ^= h >> 33;
++  h *= 0xc4ceb9fe1a85ec53ULL;
++  h ^= h >> 33;
++  return h;
++}
++
++static uint64_t mix_double(uint64_t h, double d) {
++  static_assert(sizeof(double) == sizeof(uint64_t), "unexpected double width");
++  uint64_t bits;
++  memcpy(&bits, &d, sizeof(bits));
++  return mix64(h, bits);
++}
++
++static uint64_t dft_chunk_omega_sig(const dft_chunk *cur) {
++  uint64_t h = 0xcbf29ce484222325ULL;
++  for (size_t k = 0; k < cur->omega.size(); ++k)
++    h = mix_double(h, cur->omega[k]);
++  return h;
++}
++
++/* Geometry AND update semantics: two monitors with the same bounds and frequencies
++   still accumulate differently if their decimation, weights or volume factors differ,
++   and restoring one into the other would mix samples taken under different rules.
++
++   These hash exact double bit patterns, including `scale`, which is recomputed from
++   the symmetry/Bloch phase and the timestep.  That is deterministic for the same
++   build and inputs -- the supported case -- but a checkpoint is not guaranteed
++   portable across compilers or libm versions, where a final-bit difference in the
++   recomputed phase would be reported as a monitor mismatch. */
++static uint64_t dft_chunk_geom_sig(const dft_chunk *cur) {
++  uint64_t h = 0x100000001b3ULL;
++  h = mix64(h, (uint64_t)cur->is.dim);
++  /* ivec/vec store five slots but only the directions of their own `dim` are
++     meaningful; loop over those. */
++  LOOP_OVER_DIRECTIONS(cur->is.dim, d) {
++    h = mix64(h, (uint64_t)(int64_t)cur->is.in_direction(d));
++    h = mix64(h, (uint64_t)(int64_t)cur->ie.in_direction(d));
++    h = mix_double(h, cur->s0.in_direction(d));
++    h = mix_double(h, cur->s1.in_direction(d));
++    h = mix_double(h, cur->e0.in_direction(d));
++    h = mix_double(h, cur->e1.in_direction(d));
++    h = mix64(h, (uint64_t)(int64_t)cur->shift.in_direction(d));
++  }
++  h = mix_double(h, cur->dV0);
++  h = mix_double(h, cur->dV1);
++  h = mix64(h, (uint64_t)(int64_t)cur->get_decimation_factor());
++  h = mix64(h, (uint64_t)(cur->include_dV_and_interp_weights ? 1 : 0));
++  h = mix64(h, (uint64_t)(cur->sqrt_dV_and_interp_weights ? 1 : 0));
++  h = mix_double(h, cur->stored_weight.real());
++  h = mix_double(h, cur->stored_weight.imag());
++  h = mix_double(h, cur->extra_weight.real());
++  h = mix_double(h, cur->extra_weight.imag());
++  h = mix64(h, (uint64_t)(int64_t)cur->sn);
++  h = mix64(h, (uint64_t)(int64_t)cur->vc);
++  /* update_dft() multiplies by `scale` (which folds in stored_weight, the timestep,
++     and the symmetry/shift phase) and interpolates using avg1/avg2.  Two monitors
++     identical in geometry but built under a different Courant number or symmetry
++     phase accumulate on a different basis, so these must be part of the identity. */
++  h = mix_double(h, cur->scale.real());
++  h = mix_double(h, cur->scale.imag());
++  h = mix64(h, (uint64_t)(int64_t)cur->avg1);
++  h = mix64(h, (uint64_t)(int64_t)cur->avg2);
++  return h;
++}
++
++static void chunk_dft_desc(dft_chunk *dft_chunks, std::vector<size_t> &out) {
++  for (dft_chunk *cur = dft_chunks; cur; cur = cur->next_in_chunk) {
++    out.push_back((size_t)cur->c);
++    out.push_back(cur->N);
++    out.push_back(cur->omega.size());
++    split_sig(dft_chunk_omega_sig(cur), out);
++    split_sig(dft_chunk_geom_sig(cur), out);
++  }
++}
++
++static size_t chunk_dft_ntotal(dft_chunk *dft_chunks, size_t *my_start,
++                               bool single_parallel_file) {
++  size_t n = 0;
++  for (dft_chunk *cur = dft_chunks; cur; cur = cur->next_in_chunk)
++    n += cur->N * cur->omega.size() * 2;
++  if (single_parallel_file) {
++    *my_start = partial_sum_to_all(n) - n;
++    return sum_to_all(n);
++  }
++  *my_start = 0;
++  return n;
++}
++
++static void save_dft_chunk_list(dft_chunk *dft_chunks, const char *name, h5file *file,
++                                bool single_parallel_file) {
++  size_t istart;
++  size_t n = chunk_dft_ntotal(dft_chunks, &istart, single_parallel_file);
++  char dataname[1024];
++  snprintf(dataname, 1024, "%s_dft", name);
++  file->create_data(dataname, 1, &n, false /* append_data */, false /* single_precision */);
++  for (dft_chunk *cur = dft_chunks; cur; cur = cur->next_in_chunk) {
++    size_t Nchunk = cur->N * cur->omega.size() * 2;
++    file->write_chunk(1, &istart, &Nchunk, (realnum *)cur->dft);
++    istart += Nchunk;
++  }
++  file->done_writing_chunks();
++
++  std::vector<size_t> desc;
++  chunk_dft_desc(dft_chunks, desc);
++  size_t my_nd = desc.size(), d_start = 0, d_total = my_nd;
++  if (single_parallel_file) {
++    d_start = partial_sum_to_all(my_nd) - my_nd;
++    d_total = sum_to_all(my_nd);
++  }
++  char descname[1024];
++  snprintf(descname, 1024, "%s_dftdesc", name);
++  file->create_data(descname, 1, &d_total, false /* append_data */,
++                    false /* single_precision */);
++  if (my_nd) file->write_chunk(1, &d_start, &my_nd, desc.data());
++}
++
++static void load_dft_chunk_list(dft_chunk *dft_chunks, const char *name, h5file *file,
++                                bool single_parallel_file) {
++  size_t istart;
++  size_t n = chunk_dft_ntotal(dft_chunks, &istart, single_parallel_file);
++  char dataname[1024], descname[1024];
++  snprintf(dataname, 1024, "%s_dft", name);
++  snprintf(descname, 1024, "%s_dftdesc", name);
++  int file_rank;
++  size_t file_dims;
++
++  /* Identity check FIRST, and completely.  h5file keeps a notion of the "current"
++     dataset that read_size selects and read_chunk then reads from, so the descriptor
++     must be finished with before the data's read_size runs -- interleaving them sends
++     the bulk reads to the descriptor dataset instead. */
++  std::vector<size_t> want;
++  chunk_dft_desc(dft_chunks, want);
++  size_t my_nd = want.size(), d_start = 0, d_total = my_nd;
++  if (single_parallel_file) {
++    d_start = partial_sum_to_all(my_nd) - my_nd;
++    d_total = sum_to_all(my_nd);
++  }
++  /* No DFT monitors at all: nothing to identify, and an old checkpoint of a
++     monitor-free run has no descriptor to find.  d_total is a collective total, so
++     every rank takes this branch together. */
++  if (d_total == 0) {
++    file->read_size(dataname, &file_rank, &file_dims, 1);
++    if (file_rank != 1 || file_dims != n)
++      meep::abort("incorrect dataset size (%zu vs. %zu) in fields::load %s:%s", file_dims, n,
++                  file->file_name(), dataname);
++    return;
++  }
++  if (!file->dataset_exists(descname))
++    meep::abort("%s has no '%s': it predates the DFT checkpoint fix, and its DFT data is "
++                "incomplete (only one component per monitor was ever written). Re-dump it.",
++                file->file_name(), descname);
++  file->read_size(descname, &file_rank, &file_dims, 1);
++  if (file_rank != 1 || file_dims != d_total)
++    meep::abort("DFT descriptor size mismatch (%zu vs. %zu) in fields::load %s:%s", file_dims,
++                d_total, file->file_name(), descname);
++  if (my_nd) {
++    std::vector<size_t> have(my_nd);
++    file->read_chunk(1, &d_start, &my_nd, have.data());
++    for (size_t k = 0; k < my_nd; k += DFT_DESC_STRIDE) {
++      bool same = true;
++      for (size_t j = 0; j < DFT_DESC_STRIDE; ++j)
++        if (have[k + j] != want[k + j]) same = false;
++      if (!same)
++        meep::abort("DFT monitor %zu does not match the checkpoint in fields::load: file has "
++                    "{component %zu, N %zu, %zu freqs}, simulation has "
++                    "{component %zu, N %zu, %zu freqs} (frequencies or extent may also "
++                    "differ). Recreate the DFT monitors exactly as they were when dumped.",
++                    k / DFT_DESC_STRIDE, have[k], have[k + 1], have[k + 2], want[k], want[k + 1],
++                    want[k + 2]);
++    }
++  }
++
++  /* now select the data set and read it */
++  file->read_size(dataname, &file_rank, &file_dims, 1);
++  if (file_rank != 1 || file_dims != n)
++    meep::abort("incorrect dataset size (%zu vs. %zu) in fields::load %s:%s", file_dims, n,
++                file->file_name(), dataname);
++  for (dft_chunk *cur = dft_chunks; cur; cur = cur->next_in_chunk) {
++    size_t Nchunk = cur->N * cur->omega.size() * 2;
++    file->read_chunk(1, &istart, &Nchunk, (realnum *)cur->dft);
++    istart += Nchunk;
++  }
++}
++
+ void fields::dump(const char *filename, bool single_parallel_file) {
++  assert_checkpointable(); // before the file is created/truncated
+   if (verbosity > 0) {
+     printf("creating fields output file \"%s\" (%d)...\n", filename, single_parallel_file);
+   }
+@@ -116,7 +608,7 @@
+   size_t dims[1] = {1};
+   size_t start[1] = {0};
+   size_t _t[1] = {(size_t)t};
+-  file.create_data("t", 1, dims);
++  file.create_data("t", 1, dims, false /* append_data */, false /* single_precision */);
+   if (am_master() || !single_parallel_file) file.write_chunk(1, start, dims, _t);
+ 
+   dump_fields_chunk_field(&file, single_parallel_file, "f",
+@@ -134,12 +626,15 @@
+       &file, single_parallel_file, "f_w_prev",
+       [](fields_chunk *chunk, int c, int d) { return &(chunk->f_w_prev[c][d]); });
+ 
++  // Dump the auxiliary polarization state of dispersive media.
++  dump_polarizations(&file, single_parallel_file);
++
+   // Dump DFT chunks.
+   for (int i = 0; i < num_chunks; i++) {
+     if (single_parallel_file || chunks[i]->is_mine()) {
+       char dataname[1024];
+       snprintf(dataname, 1024, "chunk%02d", i);
+-      save_dft_hdf5(chunks[i]->dft_chunks, dataname, &file, 0, single_parallel_file);
++      save_dft_chunk_list(chunks[i]->dft_chunks, dataname, &file, single_parallel_file);
+     }
+   }
+ }
+@@ -230,6 +725,7 @@
+ }
+ 
+ void fields::load(const char *filename, bool single_parallel_file) {
++  assert_checkpointable(); // before any field is overwritten
+   if (verbosity > 0)
+     printf("reading fields from file \"%s\" (%d)...\n", filename, single_parallel_file);
+ 
+@@ -267,12 +763,15 @@
+       &file, single_parallel_file, "f_w_prev",
+       [](fields_chunk *chunk, int c, int d) { return &(chunk->f_w_prev[c][d]); });
+ 
++  // Load the auxiliary polarization state of dispersive media.
++  load_polarizations(&file, single_parallel_file);
++
+   // Load DFT chunks.
+   for (int i = 0; i < num_chunks; i++) {
+     if (single_parallel_file || chunks[i]->is_mine()) {
+       char dataname[1024];
+       snprintf(dataname, 1024, "chunk%02d", i);
+-      load_dft_hdf5(chunks[i]->dft_chunks, dataname, &file, 0, single_parallel_file);
++      load_dft_chunk_list(chunks[i]->dft_chunks, dataname, &file, single_parallel_file);
+     }
+   }
+ }

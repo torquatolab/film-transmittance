@@ -1,0 +1,9 @@
+name: film-meep
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pymeep=1.31.0=mpi_mpich_*
+  - numpy
+  - matplotlib
