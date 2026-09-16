@@ -145,9 +145,8 @@ def ConvertPacking2Geometry_2D(filename: str, phi2:float, material_particle: mp.
 			size = mp.Vector3(2 * r, 2 * r, mp.inf), center = center_vec, material=material
 		)
 	elif prt_shape == "diamond":
-		# A diamond is a square rotated by 45 degrees.
-		# If 'r' is the distance from the center to a vertex along x/y axis,
-		# then the side length of the square is r * sqrt(2).
+		# A diamond is a square of side 2*r rotated by 45 degrees (area 4*r**2,
+		# matching vd above); its vertices lie r*sqrt(2) from the center.
 		particle_creator = lambda r, center_vec, material: mp.Block(
 			size = mp.Vector3(2 * r, 2 * r, mp.inf), center = center_vec, e1 = mp.Vector3(1, 1, 0), e2 = mp.Vector3(-1,1,0), material=material
 		)
@@ -162,7 +161,8 @@ def ConvertPacking2Geometry_2D(filename: str, phi2:float, material_particle: mp.
 		V = np.abs(np.linalg.det(pos[1]))
 		N = np.shape(pos[2])[0]
 		phi_curr = vd * np.sum(pos[3]**d) / V # d=2 for area
-		radii = np.copy(pos[3]) 
+		# read_packing returns an (N, 1) column; flatten it so radii[i] is a scalar.
+		radii = np.copy(pos[3][:, 0])
 		if phi2 >0.:
 			radii *= (phi2 / phi_curr)**(1./d)
 	else: 
@@ -200,7 +200,7 @@ def ConvertPacking2Geometry_2D(filename: str, phi2:float, material_particle: mp.
 		elif prt_shape == "square":
 			print(f"Adding a square at ({x0:.3f}, {y0:.3f}) with side {2 * current_radius:.3f}")
 		elif prt_shape == "diamond":
-			print(f"Adding a diamond (rotated square) at ({x0:.3f}, {y0:.3f}) with side {current_radius * np.sqrt(2):.3f}")
+			print(f"Adding a diamond (rotated square) at ({x0:.3f}, {y0:.3f}) with side {2 * current_radius:.3f}")
 
 		geometry.append(
 			particle_creator(current_radius, center_vec, material_particle)
@@ -227,7 +227,8 @@ def ConvertPacking2Geometry_3D(filename: str, phi2:float, material_particle: mp.
 		V = np.abs(np.linalg.det(pos[1]))
 		N = np.shape(pos[2])[0]
 		phi_curr = vd * np.sum(pos[3]**d) / V
-		radii = np.copy(pos[3]) 
+		# read_packing returns an (N, 1) column; flatten it so radii[i] is a scalar.
+		radii = np.copy(pos[3][:, 0])
 		if phi2 >0.:
 			radii *= (phi2 / phi_curr)**(1./d)
 	else: 
@@ -325,9 +326,15 @@ def GenerateHeader(args):
 			print("Load a saved configuration {0}".format(args.load))
 
 		header += '\tby FDTD simulations (MEEP)\n'
-		header += '\targs.dsrc/detector = {0:0.2e}\n'.format(args.ddet)
+		header += '\targs.dsrc = {0:0.2e}\n'.format(args.dsrc)
+		header += '\targs.ddet = {0:0.2e}\n'.format(args.ddet)
 		header += '\targs.dpml = {0:0.2e}\n'.format(args.dpml)
-		header += '\tdecayed ratio = {0:.1e}\n'.format(args.decay)
+		if hasattr(args, 'dft_tol'):
+			# The run stops on the DFT decay criterion; -decay only spaces multi-source pulses.
+			header += '\tdft_tol = {0:.1e}, dft_nconsec = {1}, maxt = {2:g}\n'.format(
+				args.dft_tol, args.dft_nconsec, args.maxt)
+		else:
+			header += '\tdecayed ratio = {0:.1e}\n'.format(args.decay)
 		if args.JouleHeating:
 			header += 'wavelength[1000nm]\ttransmittance\treflectance\tAbsorbance\tIncidentPower[a.u.]'	
 		else:
@@ -346,6 +353,10 @@ def DetermineCourantFactor(args, material1: mp.Medium, material2: mp.Medium, dim
 	Bidegaray-Fesquet, SIAM J. Numer. Anal. 46, 2551 (2008)).  Meep's condition
 	is @f$S < n_\min/\sqrt{d}@f$; 0.9 is a safety margin, capped at Meep's
 	default 0.5.
+
+	@note This bound ignores the dispersive poles.  With meep.materials.Ag in the 3D
+	      film example, S = 0.5 diverged at resolution <= 60 and S = 0.4 was stable
+	      at resolution 40, so coarse metal runs need a smaller S than returned here.
 
 	@param args       Unused; kept for caller compatibility.
 	@param material1  Particle medium (mp.Medium).

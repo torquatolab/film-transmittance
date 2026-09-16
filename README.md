@@ -25,7 +25,6 @@ The example is one silver cylinder per 0.2 by 0.2 micrometer unit cell, area
 fraction 0.2, thickness 0.1 micrometer, x polarization, wavelengths 0.8–1.2
 micrometers. `shared_FDTD.py` is the only local Python dependency. NumPy and Meep
 (including its material library) are required; matplotlib supports optional plots.
-The original simulation and helper scripts are included without modification.
 
 ## Why two runs?
 
@@ -57,14 +56,20 @@ Use a new directory whenever parameters change; do not run two jobs in one direc
 Wavelengths appear in descending order. Multiply T by 100 for percent.
 The script also saves field arrays and coordinate/weight arrays; it is not a
 flux-only solver. `-JouleHeating` adds absorption A as column 4, moving incident
-flux to column 5, and saves additional fields. Without it, A can be estimated
-as 1 − T − R after verifying numerical convergence.
+flux to column 5, and saves additional fields; the run exits nonzero (after
+writing the table) if max |T + |R| + A − 1| reaches 0.05. Without it, A can be
+estimated as 1 − T + (column 3), since column 3 is the negative of the physical
+reflectance, after verifying numerical convergence. The comment header records
+the file, `dsrc`, `ddet`, `dpml`, and the stopping settings.
 
 Edit the shared `common` array in `run_spectrum.sh` to change the calculation.
 Lengths use 1 micrometer as the unit; resolution is pixels per micrometer.
 `-ks` takes two angular wavenumbers: k = 2π / wavelength (micrometers), with
 kmin first. Use at least two frequencies. Keep `dsrc > ddet > 0` so the
-reflection monitor is between the source and film. Select polarization x or y.
+reflection monitor is between the source and film. Invalid frequency settings
+are rejected at startup; a violated monitor order only prints a warning, because
+the script's own defaults (`-dsrc 0.3 -ddet 0.3`) violate it. Select polarization x or y; any other
+value (including the script's default, `z`) runs an Ex source with a warning.
 `-eps` accepts Ag, Au, Cu, Ag_Drude, or a numeric dielectric constant;
 `-eps_ref` sets the film matrix, while the exterior remains vacuum.
 
@@ -73,14 +78,18 @@ basis rows, then x/y positions in the uncentered cell. Use an axis-aligned
 rectangular cell. With `-is_point`, `-phi` sets particle area fraction. Packing
 files without `-is_point` instead require the radius in the fifth column of
 each particle row. Disk particles become cylinders; squares become blocks.
-An empty `-load` gives vacuum, not a uniform film; `-Z2` is not implemented here.
+An empty `-load` gives vacuum, not a uniform film. `-Z2` and polygonal
+`.Dispersion` packings are not implemented and are rejected.
 
 `RES=120` changes example resolution; `EPS=4` selects a dielectric example.
-The supplied resolution is a starting point, not a convergence claim. Refine
+The supplied resolution is a starting point, not a convergence claim. Do not
+lower it for silver: the script uses Courant factor 0.5 for these materials,
+and the Ag example diverged (`simulation fields are NaN or Inf`) at `RES` 40,
+50, and 60, while 70 and 80 ran. At `RES=40`, Courant 0.4 was stable. Refine
 resolution, PML/separations, and DFT tolerance until the spectrum is stable.
 `MAXT=200` is a **simulation-time ceiling**, not seconds of wall time; reaching
-it produces output without proving convergence. Inspect `sample.log` and
-increase the ceiling if needed.
+it produces output without proving convergence. The log then contains a
+`WARNING: run reached the -maxt ... ceiling` line; increase the ceiling if so.
 
 ## Checkpoints: continue an interrupted calculation
 
@@ -106,7 +115,8 @@ CHECKPOINT=1 CHECKPOINT_HOURS=0.5 bash run_spectrum.sh results-checkpoint
 ```
 
 Use `-dft_nconsec 3` (already set by the wrapper): the stock single-check mode
-cannot preserve this helper's convergence history. Periodic dumps occur every
+cannot preserve this helper's convergence history, so `-checkpoint` with
+`-dft_nconsec 1` is rejected at startup. Periodic dumps occur every
 0.5 wall-clock hours in this example, plus a final dump before analysis.
 Separate `reference_checkpoints/` and `sample_checkpoints/` contain structure,
 fields, convergence history, and a completion marker. Keep each directory
@@ -148,3 +158,11 @@ a two-rank silver run, and two-rank checkpoint write/reload. Both reference
 and sample resumed; the maximum change in the saved spectrum table after
 resuming was 3e-7. These are workflow checks, not a resolution-convergence
 study or a Della execution test.
+
+Also run on Della compute nodes (Meep 1.31.0 from `environment.yml`, stock
+libmeep), comparing this version with the previous one at `RES=80`: the
+wrapper with Ag (1 and 2 ranks) and with `EPS=4`, a `-JouleHeating` Ag run, and
+a dielectric checkpoint write/resume. Transmittance, reflectance, incident flux,
+field arrays, and flux HDF5 datasets were identical. The absorption column
+changed by 2.3e-6 relative because ω is no longer rounded to four decimals; the
+sum-rule error was 5.0e-3. `della.slurm` itself was not submitted.

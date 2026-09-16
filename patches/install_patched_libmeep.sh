@@ -54,7 +54,7 @@ while [[ $# -gt 0 ]]; do
     --restore)   MODE=restore; shift ;;
     --verify-only) MODE=verify; shift ;;
     --check)     MODE=check; shift ;;
-    -h|--help)   sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
+    -h|--help)   sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
     *)           die "unknown option: $1" ;;
   esac
 done
@@ -72,7 +72,9 @@ MEEP_VER=$("$PY" -c 'import meep; print("MEEPVER<"+meep.__version__+">")' 2>&1 \
 
 # The real library file, e.g. libmeep.so.37.0.0; libmeep.so and libmeep.so.37
 # are symlinks to it and are left alone.
-LIB=$(ls "$PREFIX"/lib/libmeep.so.*.*.* 2>/dev/null | head -1)
+# Match exactly libmeep.so.N.N.N: the glob alone also matches this script's own
+# .orig-*/.prev/.lock files, which would be picked if a stale set sorts first.
+LIB=$(ls "$PREFIX"/lib/libmeep.so.*.*.* 2>/dev/null | grep -E '/libmeep\.so\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
 [[ -n $LIB && -f $LIB ]] || die "no libmeep.so.N.N.N under $PREFIX/lib"
 SONAME=$(basename "$LIB")
 

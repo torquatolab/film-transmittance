@@ -162,7 +162,8 @@ def main(args):
 		if (postfix == 'Dispersion'):
 			# Polygonal packing
 			print("Load a polygonal packing in ", args.load)
-			print("ERROR (Not implemented)")
+			# Continuing would simulate an empty cell and report T = 1 as a result.
+			raise SystemExit("ERROR: polygonal (.Dispersion) packings are not implemented")
 			# [Lx, Ly, geometry] = PolyDispersion2Geometry(args.load, eps_pol)
 		else:
 			# disk packing
@@ -193,6 +194,8 @@ def main(args):
 		src_comp = mp.Ey
 	else:
 		src_comp = mp.Ex 
+		print("WARNING: -polarization {0} is not x or y; the source is Ex, but output "
+			"files are still labelled '{0}'".format(args.polarization))
 	print("Source Polarization "+args.polarization)
 
 	if fwidth < 1.0:
@@ -306,8 +309,7 @@ def main(args):
 			# --- checkpoint: structure first, monitors next, fields last -------------
 			# meep's supported restart ordering (patches/test_checkpoint_dispersive.py).
 			# A one-shot sim.load() here would attach the dumped DFT state before the
-			# monitors exist and silently lose it, which is the bug still present in
-			# 2D_plasmonic_checkpoints2.py:312.
+			# monitors exist and silently lose it.
 			ckpt_dir = "{0}_checkpoints".format(args.saveas)
 			# Master decides and broadcasts. Each rank stat-ing the filesystem itself can
 			# disagree -- a shared filesystem need not make a file visible everywhere at
@@ -329,7 +331,9 @@ def main(args):
 						"mid-rename)".format(ckpt_dir), flush=True)
 					shutil.rmtree(ckpt_dir, ignore_errors=True)
 					os.rename(ckpt_dir + ".old", ckpt_dir)
-				if os.path.exists(ckpt_dir) and not _resumable(ckpt_dir):
+				# An EMPTY ckpt_dir is the placeholder created below before the first
+				# dump, not an interrupted one.
+				if os.path.isdir(ckpt_dir) and os.listdir(ckpt_dir) and not _resumable(ckpt_dir):
 					print("WARNING: {0} has no checkpoint_meta.json -- it is an "
 						"interrupted dump and will NOT be resumed from".format(ckpt_dir),
 						flush=True)
@@ -610,6 +614,10 @@ def main(args):
 					ckpt_dir, args.checkpoint_interval), flush=True)
 
 			sim.run(*run_args[:-1], until_after_sources=run_args[-1])
+			if args.maxt > 0 and sim.round_time() > args.maxt:
+				print("WARNING: run reached the -maxt {0:g} ceiling (t = {1:g}); the DFT "
+					"convergence criterion was not confirmed\n".format(args.maxt, sim.round_time()),
+					flush=True)
 
 			if args.checkpoint:
 				# Final checkpoint, written BEFORE any analysis touches the results.
@@ -654,7 +662,8 @@ def main(args):
 					# 8e-16) -- and has nothing to do with re-running.
 					_ok = True
 					if mp.am_master():
-						stale = temp_name + 'refl-flux.h5'
+						# save_flux prepends the filename prefix, so match that name.
+						stale = _flux_metadata_path(sim, temp_name + 'refl-flux')[:-len('.meta.json')] + '.h5'
 						if os.path.exists(stale):
 							print("removing stale flux file {0}\n".format(stale))
 							_ok = _master_save(os.remove, stale)
@@ -679,8 +688,8 @@ def main(args):
 				Absorption = np.zeros(NumFreqs)
 				_dft_ok = True
 				for i in range(NumFreqs):
-					k_i = kmin + (kmax-kmin)*i/(NumFreqs-1)
-					k_i = np.round(k_i*10000)/10000
+					k_exact = kmin + (kmax-kmin)*i/(NumFreqs-1)
+					k_i = np.round(k_exact*10000)/10000   # file names only
 					name = "{0}__ka-{1:.04f}-{2}.npy"
 
 					# store relevant field components
@@ -697,7 +706,8 @@ def main(args):
 
 					# compute and store Joule heating
 					if args.JouleHeating:
-						omege = k_i #* C0 / 1e-6 # ( unit length = 1e-6 m)
+						# angular frequency of DFT bin i (c = 1); unrounded, unlike k_i
+						omege = k_exact
 						
 						for id, components in enumerate([("Ex","Dx"),("Ey","Dy"),("Ez","Dz")]):
 							e_,d_ = components
@@ -767,22 +777,20 @@ def main(args):
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser()
 	parser.add_argument('-res', type = int, default= 50, help = 'resolution (default: 50 pixels/um)')
-	parser.add_argument('-Z2', action = 'store_true', default = False, help='generate 2D square lattice disk packing')
-	parser.add_argument('-num', type=int, default=10, help='the number of unit cells when -Z2 is called' )
+	parser.add_argument('-Z2', action = 'store_true', default = False, help='NOT IMPLEMENTED in this script; rejected if given')
+	parser.add_argument('-num', type=int, default=10, help='unused (belongs to the unimplemented -Z2)' )
 
 	parser.add_argument('-load', type=str, default='', help='load a configuration file')
 
-	parser.add_argument('-polarization', type=str, default='z', help='source polarization')
+	parser.add_argument('-polarization', type=str, default='z', help='source polarization: x or y (anything else falls back to Ex)')
 
 	parser.add_argument('-phi', type=float, default = -1.0, help = 'volume fraction of phase 2')
 	parser.add_argument('-tfilm', type=float, default = 0.1, help = 'thickness of the film')
 	parser.add_argument('-ref', action = 'store_true', default=False, help='remove the film')
 	# Recovery of runs whose reference flux was loaded at a rank count other than the
-	# one that wrote it (silent mis-framing; R comes out as ~1 + R_true).  Two stages:
-	#   dump   with -checkpoint, off the finished run's checkpoint -> S - I(M) per rank
-	#   apply  in a fresh sim, with a rank-matched reference        -> corrected R
-	# Both stages must run at the SAME rank count; layout depends on rank count alone,
-	# not on how those ranks are spread over nodes.
+	# one that wrote it (silent mis-framing; R comes out as ~1 + R_true).  Single stage:
+	# resume the affected run's checkpoint at the SAME rank count it was written with,
+	# replay the bad reference, and subtract a rank-matched good one (see main()).
 	parser.add_argument('-salvage', action='store_true', default=False,
 		help='repair R in a checkpoint whose reference flux was read at the wrong '
 			 'rank count; single stage, requires -checkpoint and -salvage_goodref')
@@ -793,7 +801,7 @@ if __name__ == '__main__':
 		help='salvage: the original *_trans-x.txt from the affected run, used to '
 			 'verify the checkpoint restored and to supply the untouched T, A, Inc')
 	parser.add_argument('-wfield', action='store_true', default=False, help='write field slices')
-	parser.add_argument('-dpml', type=float, default=0.5, help='distance from PML to the source')
+	parser.add_argument('-dpml', type=float, default=0.5, help='gap between each PML and the source (top) or transmission monitor (bottom)')
 	parser.add_argument('-tpml', type=float, default=0.5, help='relative thickness of PML to the longest wavelength')
 	parser.add_argument('-dsrc', type=float, default=0.3, help='distance from source to the film')
 	parser.add_argument('-ddet', type = float, default = 0.3, help='distance from the film to the detector')
@@ -807,7 +815,7 @@ if __name__ == '__main__':
 			 'reproducible. Any N > 0 gives LL = tfilm + 2*N/res; N >= 2 is converged, 4 recommended.')
 	parser.add_argument('-eps', type=str,  default=2, help='dielectric constant of the polarized phase (phase2)')
 	parser.add_argument('-eps_ref', type=str,  default=1, help='dielectric constant of the reference phase (phase1)')
-	parser.add_argument('-saveas', type=str, default='./temp', help='directory for saving spectra')
+	parser.add_argument('-saveas', type=str, default='./temp', help='output file-name prefix (not a directory), e.g. ./results/sample')
 
 	parser.add_argument('-comp', type=str, nargs='+', default=["Ex","Ey"], help='the list of components to save')
 
@@ -815,22 +823,40 @@ if __name__ == '__main__':
 	parser.add_argument('-nfreqs', type=int, default=50, help='the number of frequencies')
 	parser.add_argument('-fullprofile', action = 'store_true', default=False, help='perform FFT including the reference space')
 
-	parser.add_argument('-tempname', type=str, default='', help='file name for the spectra in the -ref mode')
+	parser.add_argument('-tempname', type=str, default='', help='stem shared by -ref and sample runs for the incident flux files (default: basename of -saveas)')
 	parser.add_argument('-is_point', action = 'store_true', default=False, help='load point configuration. convert it to a packing')
 
 	parser.add_argument('-JouleHeating', action = 'store_true', default=False, help='Add Joule heating calculation')
 	parser.add_argument('-ScattPower', action = 'store_true', default=False, help='Add Scattering power calculation')
-	parser.add_argument('-checkpoint', action='store_true', default=False, help='write restart checkpoints, and resume from one if present. Requires the dispersive-media dump/load patch (30_Codes/patches/); a STOCK libmeep loads a patched checkpoint silently with P=0, so preflight with install_patched_libmeep.sh --check')
-	parser.add_argument('-checkpoint_interval', type=float, default=6.0, help='hours between checkpoints (default: 6)')
+	parser.add_argument('-checkpoint', action='store_true', default=False, help='write restart checkpoints, and resume from one if present. Requires the dispersive-media dump/load patch (patches/); a STOCK libmeep loads a patched checkpoint silently with P=0, so preflight with install_patched_libmeep.sh --check')
+	parser.add_argument('-checkpoint_interval', type=float, default=6.0, help='wall-clock hours between checkpoints (default: 6)')
 
 	parser.add_argument('-scale2sim', type=float, default=1.0, help='scaling factor from the input geometry to the sample in simulation')
 
-	parser.add_argument('-test', action = 'store_true', default=False, help='testing the setup with a short animation')
-	parser.add_argument('-test2', action = 'store_true', default=False, help='testing the setup with a short animation')
+	parser.add_argument('-test', action = 'store_true', default=False, help='testing the setup with a short animation (needs a display)')
+	parser.add_argument('-test2', action = 'store_true', default=False, help='build the structure, save epsilon and grid coordinates, and skip the time stepping')
 
 	parser.add_argument('-particle', type=str, default='disk', help='particle shape')
 
 	args = parser.parse_args()
+	# Cheap argument checks, all before main() spends time building the simulation.
+	if args.Z2:
+		raise SystemExit("-Z2 is not implemented in this script; pass a -load file")
+	if args.nfreqs < 2:
+		raise SystemExit("-nfreqs must be at least 2 (got {0})".format(args.nfreqs))
+	if len(args.ks) != 2 or not 0 < args.ks[0] < args.ks[1]:
+		raise SystemExit("-ks needs exactly two wavenumbers, 0 < kmin < kmax (got {0})".format(args.ks))
+	if args.ScattPower and not args.dsrc > args.ddet > 0:
+		# A warning, not an error: the parser's own defaults (0.3, 0.3) put the reflection
+		# monitor on the source plane, and existing workflows may rely on them.
+		print("WARNING: -ScattPower expects dsrc > ddet > 0 so the reflection monitor lies "
+			"between the source and the film (got dsrc={0:g}, ddet={1:g}); R is not "
+			"meaningful otherwise".format(args.dsrc, args.ddet), flush=True)
+	if args.checkpoint and args.dft_nconsec <= 1:
+		# mp.stop_when_dft_decayed has no state_file, so this combination would die with
+		# a TypeError after the structure is built (or loaded from the checkpoint).
+		raise SystemExit("-checkpoint requires -dft_nconsec >= 2: the stock single-check "
+			"stopping condition cannot carry its convergence history across a restart")
 	# Validate salvage arguments BEFORE main() builds the simulation: at res 3500
 	# _set_materials plus the checkpoint load cost well over an hour, and a missing
 	# flag that surfaces as a NameError after that wastes a six-node allocation.
@@ -840,4 +866,14 @@ if __name__ == '__main__':
 		if _missing or args.ref:
 			raise SystemExit("-salvage requires {0}{1}".format(
 				_missing, " and is incompatible with -ref" if args.ref else ""))
+		# main() reads T, R, A and Inc from columns 1-4 of this table (a -JouleHeating
+		# table), but only after the checkpoint load; check the shape now.
+		try:
+			_ncol = np.atleast_2d(np.loadtxt(args.salvage_origtable)).shape[1]
+		except (OSError, ValueError) as exc:
+			raise SystemExit("-salvage_origtable {0} is unreadable: {1}".format(
+				args.salvage_origtable, exc))
+		if _ncol != 5:
+			raise SystemExit("-salvage_origtable must be a 5-column -JouleHeating table "
+				"(wl, T, R, A, Inc); {0} has {1}".format(args.salvage_origtable, _ncol))
 	main(args)

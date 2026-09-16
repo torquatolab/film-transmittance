@@ -8,7 +8,7 @@ ordering: load the structure, add the DFT monitors, then load the fields.
 Two things are checked independently:
 
 * **field state** -- must agree to round-off.  This is what
-  ``meep-1.31.0-checkpoint-dispersive.patch`` fixes; without it ``dump`` aborts
+  ``meep-checkpoint-dispersive.patch`` fixes; without it ``dump`` aborts
   outright with "non-null polarization_state in fields::dump (unsupported)".
 * **accumulated DFT flux** -- also asserted.  This used to be excluded: stock meep
   dumps the DFT accumulators but restores only part of them, because fields::dump
