@@ -1,8 +1,8 @@
 # ===========================================
-# A python code to compute the planar electric (E) and 
-# dielectric displacement field (D) at given frequencies 
-# and their transmittance spectra  
-# via fintie-difference time-difference simulations.
+# Broadband power transmittance (and reflectance, optionally absorption) of a
+# finite-thickness film patterned with a periodic 2D disk/square array, computed
+# with 3D Meep FDTD: periodic in x/y, PML in z, normally incident plane wave.
+# Also saves frequency-domain field arrays (E, and D for -JouleHeating) in the film.
 # ===========================================
 
 from __future__ import division
@@ -21,10 +21,9 @@ import sys
 #sys.path.insert(1, '/home/jaeukk/codes/python')
 #import PolyDispersion as tp
 
-from shared_FDTD import *
+from film_fdtd_utils import *
 
-## ---- for using material library ----
-# vim ~/miniconda/envs/mp/lib/python3.7/site-packages/meep/materials.py
+## ---- Meep material library (meep/materials.py) ----
 from meep.materials import Cu
 from meep.materials import Au
 from meep.materials import Ag
@@ -391,7 +390,7 @@ def main(args):
 					# add transmittivity monitor
 
 			# Stop on convergence of the DFT accumulators rather than of the raw field at
-			# one point (ported from 2D_plasmonic.py, 2026-08-07): a single probe can sit
+			# one point (ported from an earlier 2D script, 2026-08-07): a single probe can sit
 			# on a node, and the decay ratio is NOT monotone near the noise floor, so
 			# -dft_nconsec > 1 requires the tolerance to hold for that many successive
 			# checks.  -decay is retained only for the multi-source spacing.
@@ -636,7 +635,7 @@ def main(args):
 			(x,y,z,w) = sim.get_array_metadata(vol=nonpml_vol)
 			print("saving metafiles...\n")
 			print("{0}_{1}.npy\n\n".format(args.saveas, '...'))
-			# write-race guard (ported from 2D_plasmonic.py, 2026-08-10): only the
+			# write-race guard (ported from an earlier 2D script, 2026-08-10): only the
 			# master rank writes; collective calls above run on all ranks.
 			_ok = _master_save(np.save, ("{0}_{1}.npy").format(args.saveas, 'x'), x)
 			if dimension == 2:

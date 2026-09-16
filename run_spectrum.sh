@@ -25,8 +25,8 @@ common=(-load "$package_dir/examples/one_disk.txt" -is_point -phi 0.2
         -ScattPower -comp Ex -dft_margin_px 4
         -dft_nconsec 3 -dft_tol 1e-8 -maxt "${MAXT:-200}"
         -tempname incident)
-"${launcher[@]}" python "$package_dir/2D_plasmonic_film.py" \
+"${launcher[@]}" python "$package_dir/film_transmittance.py" \
     "${common[@]}" "${checkpoint[@]}" -ref -saveas reference > reference.log 2>&1
-"${launcher[@]}" python "$package_dir/2D_plasmonic_film.py" \
+"${launcher[@]}" python "$package_dir/film_transmittance.py" \
     "${common[@]}" "${checkpoint[@]}" -saveas sample > sample.log 2>&1
 printf 'Spectrum: %s/sample_trans-x.txt\n' "$PWD"

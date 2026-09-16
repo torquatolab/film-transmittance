@@ -1,10 +1,13 @@
+# Helpers for film_transmittance.py: pattern-file readers and 2D-pattern geometry,
+# material selection, output header, Courant factor, and a restart-safe DFT
+# convergence stopping condition.
+
 import meep as mp
 import numpy as np
 import json
 import os
 
-## ---- for using material library ----
-# vim ~/miniconda/envs/mp/lib/python3.7/site-packages/meep/materials.py
+## ---- Meep material library (meep/materials.py) ----
 from meep.materials import Cu
 from meep.materials import Au
 from meep.materials import Ag
@@ -316,7 +319,7 @@ def GenerateHeader(args):
 	## add information about the geometry ##
 
 	if args.load != '':
-		header += 'a custom disk/sphere packing'
+		header += 'a film patterned with a custom disk/square packing'
 		if args.ref:
 			header += '(reference)\n'
 			print("(reference)\n")	

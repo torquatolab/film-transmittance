@@ -1,4 +1,7 @@
-# meep checkpointing for dissipative (metallic) media
+# Meep checkpointing for dispersive (metallic) media
+
+This directory supports the optional `-checkpoint` mode of `../film_transmittance.py`
+(`CHECKPOINT=1` in `../run_spectrum.sh`). It is not needed for ordinary runs.
 
 `meep-checkpoint-dispersive.patch` extends `Simulation.dump`/`load` so a
 run containing **dispersive media** — materials carrying Lorentz/Drude
@@ -7,7 +10,8 @@ resumed. Gyrotropic media are covered too. `multilevel_susceptibility` is **not*
 still aborts, as it does in stock meep, because its *structure* does not round-trip
 either (it has no `dump_params`).
 
-Applies cleanly to **1.31.0** (local `pmp`) and **1.33.0** (Nurion `pmp`).
+Applies cleanly to Meep **1.31.0** (the version pinned in `../environment.yml`;
+re-checked with `patch --dry-run` on 2026-09-16) and was also built against **1.33.0**.
 Stock meep refuses outright:
 
 ```
@@ -17,8 +21,7 @@ RuntimeError: meep: non-null polarization_state in fields::dump (unsupported)
 ## Why it was dielectric-only
 
 Under the ADE scheme each Lorentz/Drude pole carries its own auxiliary
-polarization field `P_n`, time-stepped in lockstep with `E` and `H` (see
-`<vault>/20_Topics/10_Classical_Electrodynamics/99_FDTD/Dispersive_Media_in_FDTD.md`).
+polarization field `P_n`, time-stepped in lockstep with `E` and `H`.
 `P_n` is *independent dynamical state*: it cannot be recomputed from `E`, `H` and
 the material at a single instant. `fields::dump` only wrote `f`, `f_u`, `f_w`,
 `f_cond`, `f_bfast`, `f_w_prev` and the DFT chunks, so upstream took the honest
@@ -76,6 +79,11 @@ stock meep. The gap was specifically the ADE state.
    while looking like a faithful restart. Refusing matches what stock meep does for
    every dispersive material. Supporting it properly means dumping each rank's 624 MT
    words plus `mti`; not done.
+7. **A per-pole descriptor** (`pol_desc`): `{global chunk index, block length}` per
+   pole, in the same order as the data, compared before any polarization data is read.
+   It pins per-pole boundaries that a per-chunk total misses — dumping
+   `[Lorentzian 2N, gyrotropic 6N]` and loading `[gyrotropic 6N, Lorentzian 2N]` has
+   the same chunk total `8N` but a different descriptor, and is rejected.
 8. **DFT monitors are now restored.** `fields::dump` always wrote the DFT
    accumulators, but `fields::load` brought back only part of them, so a resumed run's
    spectrum was wrong by ~0.3–3 %. Cause: a `dft_chunk` is threaded onto **two** lists
@@ -102,11 +110,6 @@ stock meep. The gap was specifically the ADE state.
    3D chunk with `ntot > 16.7e6`: `num_f*`, `t`, `num_chi1inv`, `gv_nums` and `num_sus`
    are now created with `single_precision=false`, as are this patch's own `num_pol`,
    `pol_desc` and `_dftdesc`.
-7. **A per-pole descriptor** (`pol_desc`): `{global chunk index, block length}` per
-   pole, in the same order as the data, compared before any polarization data is read.
-   It pins per-pole boundaries that a per-chunk total misses — dumping
-   `[Lorentzian 2N, gyrotropic 6N]` and loading `[gyrotropic 6N, Lorentzian 2N]` has
-   the same chunk total `8N` but a different descriptor, and is rejected.
 
 If a simulation has no susceptibilities, nothing is written and the file is
 byte-identical to what stock meep produces, so existing dielectric checkpoints
@@ -120,18 +123,18 @@ through, then repeats it with a mid-flight dump and a restart in a fresh
 
 | material | stock 1.31.0 | patched |
 |---|---|---|
-| `diel` — `Medium(epsilon=12)` (control) | PASS | PASS |
+| `diel` — `Medium(epsilon=12)` (control) | FAIL: fields exact, DFT flux rel err `3.6e-03` | PASS |
 | `drude` — single Drude pole | **abort** | PASS, rel err `0.00e+00` |
 | `ag` — `meep.materials.Ag`, multi-pole | **abort** | PASS, rel err `0.00e+00` |
 
 For deterministic Lorentz/Drude materials the restored **field trajectory** is
-bit-exact, not merely close. That is not the same as the whole simulation being
-bit-exact, and it excludes `noisy_lorentzian_susceptibility` entirely (see caveats): the accumulated DFT flux still differs
-(see caveats), and the pass criterion is one `Ez` sample after `T2`, not a full-array
-comparison. The test is non-vacuous — during development, when the dump/load pair
+bit-exact, not merely close. The test passes only if one `Ez` sample after `T2`
+agrees to ≤1e-9 relative **and** the accumulated DFT flux spectrum agrees to ≤1e-9
+relative; it is a gross-error tripwire, not a component-by-component comparison of
+every array. It excludes `noisy_lorentzian_susceptibility`, which the patch refuses
+(see item 6). The test is non-vacuous — during development, when the dump/load pair
 silently wrote and read nothing (P zero on restart), the `drude` case failed at
-`rel = 1.262e+01` — but it demonstrates a gross-error tripwire at one point, not
-component-by-component equivalence.
+`rel = 1.262e+01`.
 
 ```bash
 python test_checkpoint_dispersive.py /tmp/ck ag
@@ -139,10 +142,8 @@ python test_checkpoint_dispersive.py /tmp/ck ag
 
 ### Caveats
 
-* ~~MPI is unverified.~~ **Verified on Nurion** (2026-09-01, meep 1.33.0):
-  `mpirun -np 2` and `-np 4` both restart bit-exact (`rel=0.00e+00`) for
-  `meep.materials.Ag`. It could not be tested locally — `mpirun` does not run in
-  the sandbox this was developed in.
+* **MPI** was verified on another cluster (2026-09-01, Meep 1.33.0): `mpirun -np 2`
+  and `-np 4` both restart bit-exact (`rel=0.00e+00`) for `meep.materials.Ag`.
 * **DFT monitors must be recreated exactly as they were** — same components,
   frequencies, positions, count, weights and `Courant`. Anything else is rejected with
   a message naming the mismatching monitor. Checkpoints written before this fix carry
@@ -189,11 +190,12 @@ python test_checkpoint_dispersive.py /tmp/ck ag
   sim.load(d, load_structure=False, load_fields=True)
   ```
 
-  `2D_plasmonic_checkpoints2.py:312` calls `sim.load(checkpoint_dir)` in one
-  shot; it needs splitting for the flux monitors to be restored.
+  `../film_transmittance.py` follows this order; a one-shot
+  `sim.load(checkpoint_dir)` would not restore the flux monitors.
 * **Ag is stiff.** `Courant=0.3` at `resolution=40` was the stability floor for
   meep's Ag fit in the test; the default `0.5` diverges. Unrelated to
-  checkpointing, but it will bite anyone running the test.
+  checkpointing; the 3D film example shows the same effect at low resolution
+  (see `../README.md`).
 
 ## Installing
 
@@ -253,170 +255,68 @@ assert-based test would exit 0 while printing FAIL and a bad library would pass 
 gate. `verify` also checks that the library actually exports
 `fields::dump_polarizations` before running anything.
 
-### Done so far
+### Building on a cluster
 
-| env | meep | soname | status |
-|---|---|---|---|
-| `~/miniconda3/envs/pmp` (local) | 1.31.0 | `libmeep.so.35.0.0` | installed, verified |
-| `/scratch/e1837a01/.conda/envs/pmp` (Nurion) | 1.33.0 | `libmeep.so.37.0.0` | installed, verified serial + MPI np=2,4 |
-
-### On Nurion
-
-Nurion's autotools are old, so ship a source tree that is already patched **and**
-`autoreconf`'d rather than regenerating there:
+The installer downloads the Meep source unless `--tarball` is given, so on a
+cluster with offline compute nodes (such as Princeton Della) fetch the tarball
+on a login node first, then build on an allocated compute node:
 
 ```bash
-# locally
-tar xzf meep-1.33.0.tar.gz && cd meep-1.33.0
-patch -p1 < meep-checkpoint-dispersive.patch
-# the installer checks WHICH patch a reused build dir was built from
-sha256sum ../meep-checkpoint-dispersive.patch > .patch-applied
-autoreconf --install --force
-cd .. && tar czf meep-1.33.0-patched.tar.gz meep-1.33.0
-
-# stage through nurion-dm (file I/O never goes through `nurion`)
-scp -O install_patched_libmeep.sh meep-checkpoint-dispersive.patch \
-       test_checkpoint_dispersive.py meep-1.33.0-patched.tar.gz \
-       nurion-dm:/scratch/e1837a01/meep-patch/
-
-# build detached on `nurion`, so a dropped ssh master cannot SIGHUP it
-ssh nurion 'cd /scratch/e1837a01/meep-patch && setsid bash install_patched_libmeep.sh \
-  --prefix /scratch/e1837a01/.conda/envs/pmp \
-  --tarball /scratch/e1837a01/meep-patch/meep-1.33.0-patched.tar.gz \
-  --build-dir /scratch/e1837a01/meep-patch/build --jobs 8 \
-  > install.log 2>&1 </dev/null &'
+# login node
+curl -fL -o meep-1.31.0.tar.gz \
+  https://codeload.github.com/NanoComp/meep/tar.gz/refs/tags/v1.31.0
+# compute node, env activated
+bash patches/install_patched_libmeep.sh --prefix "$CONDA_PREFIX" \
+  --tarball "$PWD/meep-1.31.0.tar.gz" --build-dir "$PWD/meep-build" --jobs 8
 ```
 
-Notes for Nurion specifically:
+Where Autotools are too old to run `autoreconf`, apply the patch and run
+`autoreconf --install --force` elsewhere, write
+`sha256sum meep-checkpoint-dispersive.patch > .patch-applied` in the source tree
+(the installer checks which patch a reused tree was built from), and pass the
+repacked tree as `--tarball`. Notes:
 
-* meep only needs **C++11**, so the default `gcc/7.2.0` is fine — and preferable
-  to a newer module, since a lib built against an older libstdc++ ABI still runs
-  against the env's newer one, not the reverse.
-* conda's `mpicc` is a wrapper whose backend compiler is not installed. The
-  script probes it with a real compile (`mpicc -show` succeeds regardless) and
-  falls back to `MPICH_CC=gcc MPICH_CXX=g++`.
-* The build survives the login node's 1200 s **per-process** CPU cap: `make -j`
-  spawns many short compiler processes, none near the limit.
-* **Scratch purge will eventually eat the env.** After any rebuild of `pmp`,
-  rerun this script — a stock env silently reverts to aborting at the first
-  checkpoint, hours into a job.
+* Meep needs only **C++11**; an older GCC is fine, since a library built against
+  an older libstdc++ ABI still runs against the environment's newer one.
+* Conda's `mpicc` wraps a backend compiler that may be missing. The script probes it
+  with a real compile and falls back to `MPICH_CC=gcc MPICH_CXX=g++`.
+* **Rebuilding or recreating the environment reinstalls stock libmeep.** Rerun the
+  installer afterwards; `run_spectrum.sh` runs `--check` before any checkpointed job.
 
-## Review
+## Review history
 
-Reviewed 2026-09-01 by two independent Codex-family workers (critic `gpt-5.6-sol`,
-verifier `gpt-5.6-terra`) under the `orchestration` policy, since the patch was
-Claude-authored. Independently confirmed correct: the `internal_data_num` size
-arithmetic for `num == 0` and `num == 1`; that **no P/P_prev pointer swap** exists
-(`SWAP` only exchanges local anisotropic-direction variables — a swap would have
-silently transposed the two halves on restore); that the forced allocation's use of
-`fc->f` matches `fields_chunk::update_pols`; that the added collective ordering is
-consistent under unchanged topology including the sharded path; that appending the
-two virtuals leaves class size and existing vtable slots untouched, so the SWIG ABI
-claim holds for the same toolchain; that HDF5 converts old float32 `sigma` to double
-automatically; and that `multilevel_susceptibility` has no `dump_params` and so
-correctly inherits the aborting base hook.
+The patch and installer were reviewed in several rounds on 2026-09-01, with the
+code run between rounds. Findings that shaped the current version:
 
-The review found **no defect in the C++ patch**. Everything it did find was in the
-claims, the test's failure path, or the installer. One finding was **refuted** on
-verification and deliberately not acted on: the identical-chunk-layout requirement is
-a documented upstream constraint, not a regression introduced here.
+* **C++ patch:** `noisy_lorentzian_susceptibility` was only half checkpointed (fixed
+  by refusing it); per-chunk totals did not pin per-pole boundaries (fixed by
+  `pol_desc`); a late refusal truncated an existing checkpoint (fixed by the
+  `supports_checkpoint()` preflight); keying the descriptor on `get_id()` was
+  removed because the id cannot identify poles.
+* **DFT restore:** the monitor descriptor initially ignored decimation, weights,
+  `scale`, and `avg1/avg2`, and an early hash kept only 52 bits; the signature is now
+  a full 64-bit hash over those fields.
+* **Installer:** `--check` reads the libraries actually mapped by Python rather than
+  globbing `$PREFIX/lib`; the symbol check uses `nm`/`readelf`/`objdump` and no longer
+  races with SIGPIPE; a reconfigure runs `make clean`; `--restore` takes
+  `.orig-$MEEP_VER` exactly.
 
-### C++ audit, three rounds (2026-09-01)
+Runtime evidence at the time: `diel`/`drude`/`ag` restored bit-exact serially and at
+`mpirun -np 2` and `-np 4`, DFT flux agreed to ≤1e-9, and differently recreated
+monitors (frequency count, position, monitor count, frequencies, `Courant`) were each
+rejected.
 
-A later three-round audit targeted the **C++ patch alone**, with the conductor running
-the code between rounds (the workers are sandboxed read-only and can execute nothing).
-It found real defects the earlier script-focused passes had missed:
-
-* **Round 1** — `noisy_lorentzian` silently half-checkpointed (P restored, noise stream
-  not); per-chunk totals established no per-pole boundaries. Both fixed. It also cleared
-  the complex/Bloch, Mirror-symmetry, cylindrical, magnetic-dispersion and gyrotropic
-  paths, and confirmed repeated dump/load does not reallocate.
-* **Round 2** — caught a **regression I had just introduced**: keying the descriptor on
-  `get_id()` was false assurance (a static counter cannot distinguish reordered poles)
-  *and* could spuriously abort a legitimate fields-only load onto a rebuilt structure.
-  The id was removed. It also found the noisy refusal fired *too late* — after `dump`
-  had already truncated the target file, destroying any existing checkpoint there.
-  Hence `supports_checkpoint()` and the preflight.
-* **Round 3** — `ship-with-documented-limitations`; no remaining reachable defect for
-  2D/3D Ag FDTD with PML, real fields, MPI and DFT monitors. One stale comment fixed.
-
-Runtime evidence gathered between rounds: `diel`/`drude`/`ag` stay bit-exact
-(`rel = 0.00e+00`) after every change, serial and at `mpirun -np 2` and `-np 4`; a noisy
-sim now refuses with a pre-existing good checkpoint left byte-identical (313512 bytes
-before and after, where the earlier build truncated it); and a fields-only load onto a
-rebuilt structure with deliberately desynchronised ids is accepted.
-
-### DFT audit, three rounds (2026-09-01)
-
-A third three-round audit covered the DFT-restore fix. Each round found something real:
-
-* **Round 1** — `sound-with-caveats`: the DFT data carried no per-monitor identity, so
-  a monitor recreated differently could inherit another's samples. Confirmed
-  `next_in_chunk` was the right list, and that the collective structure was unchanged.
-* **Round 2** — `defective`, and it caught a genuine flaw in the descriptor I had just
-  added: masking the hash at **every** mixing step meant only the low 52 bits of each
-  input survived, which for an IEEE-754 double is the mantissa — so `ω` and `2ω`
-  collided. It also flagged that the descriptor ignored `decimation_factor` and the
-  weights, and that upstream's `num_f*`/`t`/`num_chi1inv`/`gv_nums` share the float32
-  metadata bug. All fixed.
-* **Round 3** — `do-not-ship`: `scale` and `avg1/avg2` were still unsigned (so the same
-  monitor under a different `Courant` was accepted), `fold52` truncated on a 32-bit
-  `size_t`, and `num_sus` was still float32. All three fixed.
-* **Round 4**, a re-audit of those round-3 fixes — `sound-with-caveats`: they were
-  correct, with the avalanche verified bit by bit. But narrowing to 31 bits had not
-  been *necessary* (only the 32-bit `size_t` cast was at issue, not the HDF5 path), and
-  it cost detection strength. The signature is now the full 64-bit hash stored as two
-  32-bit words. It also noted that hashing a recomputed `scale` ties a checkpoint to
-  its build; that is now documented rather than changed.
-
-Two bugs surfaced only by instrumenting the running library, not by reading:
-`ivec` holds five slots of which only the active directions are meaningful, and
-`h5file` keeps a *current* dataset that `read_size` selects — reading the descriptor
-between `read_size(data)` and the bulk reads silently redirected them.
-
-Runtime evidence: identical monitor restores `rel = 0.00e+00`; different frequency
-count, position, monitor count, frequencies×2, and `Courant` are each rejected;
-`diel`/`drude`/`ag` pass with DFT flux now **asserted** at ≤1e-9, serial and at
-`mpirun -np 2` and `-np 4`; monitor-free runs still restore bit-exact.
-
-### Script audit rounds
-
-A second critic pass over the *fixes* returned `fixes-defective` and was largely
-right. Round two therefore changed:
-
-* `--check` resolved the library by globbing `$PREFIX/lib` instead of asking what the
-  interpreter actually maps — `LD_PRELOAD` / `LD_LIBRARY_PATH` diverge those. It now
-  reads `/proc/self/maps` and requires every mapped `libmeep` image to carry the symbol.
-* the `grep -a` byte-search fallback was not a fail-closed symbol test (it would accept
-  debug or string-table residue). Now `nm` → `readelf` → `objdump`, and it reports
-  "cannot verify" rather than guessing.
-* **a SIGPIPE race in the symbol check.** `nm … | grep -q` lets grep exit on the first
-  hit, which SIGPIPEs `nm`; under `set -o pipefail` that surfaces as status 141 and a
-  spurious "not patched". It failed only *sometimes* — the worst way for a preflight to
-  be wrong, and the earlier "symbols: PASS" runs on both machines were luck. The symbol
-  table is now captured before matching (verified 8/8 locally, 5/5 on Nurion).
-* `make` does not rebuild objects merely because the compile commands changed, so a
-  reconfigure of an existing tree now runs `make clean` first.
-* `--restore` chose the newest `.orig-*` by mtime; it now takes `.orig-$MEEP_VER` exactly.
-
-### Known gaps — reviewed, not actioned
-
-Recorded rather than fixed, so nobody has to rediscover them:
+### Known gaps
 
 1. **`.prev` keeps a single generation.** Every install overwrites it. If the live
    library were already wrong, that wrong library becomes the new checksum-valid
-   rollback target — the record proves it did not change, not that it was ever good.
-   `.orig-<version>` is the escape hatch, and `--restore` targets it.
-2. **`multilevel_susceptibility` remains unimplemented** — it aborts, as in stock meep.
-   Its structure does not round-trip either, so implementing the field side alone
-   would not help.
-3. **The DFT-across-checkpoint gap is untouched** (see caveats). It is a third,
-   pre-existing defect that also affects pure dielectrics, and it is the one thing
-   here that still silently perturbs a published number — the ε_eff retrieval reads
-   `add_flux` results across a restart.
+   rollback target. `.orig-<version>` is the escape hatch, and `--restore` targets it.
+2. **`multilevel_susceptibility` remains unimplemented** — it aborts, as in stock Meep.
+3. **Equal-size pole reordering is not detected** on a fields-only load (see caveats);
+   loading the structure from the same checkpoint, as the film script does, avoids it.
 
 ## Upstreaming
 
-Items 1–3 are a clean upstream contribution (they replace an explicit
-"unsupported" abort). Item 4 is an independent bug fix worth its own PR. The
-DFT-across-checkpoint gap in the caveats is a third, separate issue.
+Items 1–7 replace an explicit "unsupported" abort and form one upstream
+contribution. Items 8–10 fix pre-existing upstream bugs (DFT restore and float32
+`size_t` metadata) that also affect pure dielectrics and are worth separate PRs.

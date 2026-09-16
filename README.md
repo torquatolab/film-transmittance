@@ -1,12 +1,29 @@
-# Transmittance through a patterned 3D film
+# Transmittance through a patterned film
 
-This package uses Meep FDTD to calculate broadband power transmittance through a
-finite-thickness patterned film. Despite its name, `2D_plasmonic_film.py` runs in
-**3D**: a 2D disk/square pattern is extruded along z. Boundaries are periodic in
-x/y, with PML in z; a normally incident plane wave travels toward negative z.
-It models an infinite periodic film, not an isolated object or arbitrary 3D mesh.
-For a general 3D structure, replace the geometry construction in `main()` and
-adapt the cell, source, and monitors as needed.
+This package uses 3D Meep FDTD to calculate broadband power transmittance (plus
+signed reflectance, and optionally absorption) of a finite-thickness film
+patterned with a periodic 2D array of disks or squares. The pattern is extruded
+along z through the film thickness. Boundaries are periodic in x/y, with PML in
+z; a normally incident plane wave travels toward negative z. Particles may be
+metals (Ag, Au, Cu) or dielectrics. It models an infinite periodic film, not an
+isolated object or arbitrary 3D mesh. For a general 3D structure, replace the
+geometry construction in `main()` and adapt the cell, source, and monitors.
+
+| File | Purpose |
+|---|---|
+| `film_transmittance.py` | The simulation: reference or sample run, spectrum and field output |
+| `film_fdtd_utils.py` | Helpers: pattern-file readers, geometry, materials, Courant factor, stopping condition |
+| `run_spectrum.sh` | Runs the reference and sample stages with shared settings |
+| `della.slurm` | Princeton Della batch template for `run_spectrum.sh` |
+| `examples/one_disk.txt` | Example pattern: one disk per square unit cell |
+| `patches/` | Optional Meep patch and installer needed for checkpoint/restart |
+| `environment.yml` | Conda environment with MPI-enabled Meep 1.31.0 |
+
+These two Python files were previously named `2D_plasmonic_film.py` and
+`shared_FDTD.py`. Meep prefixes flux files with the script name, so reference
+flux files written by the old script (`2D_plasmonic_film-*refl-flux.h5` and its
+`.meta.json`) are not found by the renamed script. Rerun the reference stage,
+or rename those two files to the `film_transmittance-` prefix.
 
 ## Install and run
 
@@ -23,7 +40,7 @@ NP=4 bash run_spectrum.sh results-mpi
 
 The example is one silver cylinder per 0.2 by 0.2 micrometer unit cell, area
 fraction 0.2, thickness 0.1 micrometer, x polarization, wavelengths 0.8–1.2
-micrometers. `shared_FDTD.py` is the only local Python dependency. NumPy and Meep
+micrometers. `film_fdtd_utils.py` is the only local Python dependency. NumPy and Meep
 (including its material library) are required; matplotlib supports optional plots.
 
 ## Why two runs?
@@ -36,7 +53,9 @@ micrometers. `shared_FDTD.py` is the only local Python dependency. NumPy and Mee
    upper monitor separates reflection from illumination.
 
 The wrapper runs both stages in order with identical settings. Preserve the
-incident `.npy`, flux `.h5`, and `.meta.json` files together in the run directory.
+reference files together in the run directory: `incident_inc_flux.npy`,
+`film_transmittance-incidentrefl-flux.h5`, and its `.meta.json` (the stem is
+`-tempname`, here `incident`).
 Use the same geometry input (even for `-ref`), cell, resolution, source,
 frequencies, monitor layout, Meep build, and MPI rank count for both stages.
 The code checks the saved rank count but does not validate every parameter.
@@ -55,7 +74,9 @@ Use a new directory whenever parameters change; do not run two jobs in one direc
 
 Wavelengths appear in descending order. Multiply T by 100 for percent.
 The script also saves field arrays and coordinate/weight arrays; it is not a
-flux-only solver. `-JouleHeating` adds absorption A as column 4, moving incident
+flux-only solver. For `-saveas sample` these are `sample_{x,y,z,w}.npy` and, per
+frequency, `sample__ka-<k>-<component>.npy`, where `<k>` is the angular
+wavenumber rounded to four decimals. `-JouleHeating` adds absorption A as column 4, moving incident
 flux to column 5, and saves additional fields; the run exits nonzero (after
 writing the table) if max |T + |R| + A − 1| reaches 0.05. Without it, A can be
 estimated as 1 − T + (column 3), since column 3 is the negative of the physical
@@ -67,9 +88,10 @@ Lengths use 1 micrometer as the unit; resolution is pixels per micrometer.
 `-ks` takes two angular wavenumbers: k = 2π / wavelength (micrometers), with
 kmin first. Use at least two frequencies. Keep `dsrc > ddet > 0` so the
 reflection monitor is between the source and film. Invalid frequency settings
-are rejected at startup; a violated monitor order only prints a warning, because
-the script's own defaults (`-dsrc 0.3 -ddet 0.3`) violate it. Select polarization x or y; any other
-value (including the script's default, `z`) runs an Ex source with a warning.
+are rejected at startup; a violated monitor order only prints a warning,
+because the script's own defaults (`-dsrc 0.3 -ddet 0.3`) violate it. Select
+polarization x or y; any other value (including the script's default, `z`) runs
+an Ex source with a warning.
 `-eps` accepts Ag, Au, Cu, Ag_Drude, or a numeric dielectric constant;
 `-eps_ref` sets the film matrix, while the exterior remains vacuum.
 
@@ -77,7 +99,8 @@ value (including the script's default, `z`) runs an Ex source with a warning.
 basis rows, then x/y positions in the uncentered cell. Use an axis-aligned
 rectangular cell. With `-is_point`, `-phi` sets particle area fraction. Packing
 files without `-is_point` instead require the radius in the fifth column of
-each particle row. Disk particles become cylinders; squares become blocks.
+each particle row. `-particle` selects `disk` (default; becomes a cylinder),
+`square`, or `diamond` (a square rotated 45°); squares become blocks.
 An empty `-load` gives vacuum, not a uniform film. `-Z2` and polygonal
 `.Dispersion` packings are not implemented and are rejected.
 
@@ -151,18 +174,20 @@ Setup references (consulted September 16, 2026):
 - [Princeton MPI guidance](https://researchcomputing.princeton.edu/support/knowledge-base/mpi4py)
 - [Meep installation](https://meep.readthedocs.io/en/latest/Installation/)
 
-## Local validation
+## Validation
 
-Validated with Meep 1.31.0: shell/Python syntax, a serial dielectric run,
-a two-rank silver run, and two-rank checkpoint write/reload. Both reference
-and sample resumed; the maximum change in the saved spectrum table after
-resuming was 3e-7. These are workflow checks, not a resolution-convergence
-study or a Della execution test.
+Earlier local checks with Meep 1.31.0 (patched libmeep): shell/Python syntax, a
+serial dielectric run, a two-rank silver run, and two-rank checkpoint
+write/reload. Both reference and sample resumed; the maximum change in the
+saved spectrum table after resuming was 3e-7.
 
-Also run on Della compute nodes (Meep 1.31.0 from `environment.yml`, stock
-libmeep), comparing this version with the previous one at `RES=80`: the
-wrapper with Ag (1 and 2 ranks) and with `EPS=4`, a `-JouleHeating` Ag run, and
-a dielectric checkpoint write/resume. Transmittance, reflectance, incident flux,
-field arrays, and flux HDF5 datasets were identical. The absorption column
-changed by 2.3e-6 relative because ω is no longer rounded to four decimals; the
-sum-rule error was 5.0e-3. `della.slurm` itself was not submitted.
+Della compute nodes, Meep 1.31.0 from `environment.yml` with stock libmeep:
+the wrapper with Ag (1 and 2 ranks) and with `EPS=4`, a `-JouleHeating` Ag run,
+a packing-file run, and a dielectric checkpoint write/resume, each compared with
+the preceding version of the code at `RES=80`. Transmittance, reflectance,
+incident flux, field arrays, and flux HDF5 datasets were identical; the
+absorption column changed by 2.3e-6 relative when ω stopped being rounded to four
+decimals, and the sum-rule error was 5.0e-3. After the file renames, the same
+runs plus square and diamond particles gave numerically identical outputs; only
+the flux-file prefix and the header text changed. These are workflow checks, not a resolution-convergence study;
+`della.slurm` itself was not submitted.
