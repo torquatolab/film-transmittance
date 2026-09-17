@@ -14,7 +14,7 @@ Plain script, no pytest; exits nonzero on failure.  Run on a compute node
 		is the same, and NOF_DIR holds no __ka-* files but the _x/_y/_z/_w metadata.
 	selected FULL_DIR SEL_DIR WL1 [WL2 ...]
 		The __ka-* arrays of a -field_wavelengths run equal the full run's arrays
-		(same file names) to <= 1e-6 relative, SEL_DIR has no other __ka-* files,
+		(same file names) to <= 1e-5 relative (contract amendment A4), SEL_DIR has no other __ka-* files,
 		and the T/R table has the same format.
 	rejections SCRIPT
 		Invalid flag combinations exit nonzero with a clear message before the
@@ -34,7 +34,9 @@ import numpy as np
 
 EXCLUDE_SUFFIXES = (".log", ".out", ".meta.json")
 DT_TOL = 0.01
-REL_TOL = 1e-6
+# Contract amendment A4: runs that stop independently differ by ~3e-6 (the full run
+# stops earlier); forced to the same stop step the arrays are bitwise equal.
+REL_TOL = 1e-5
 H5DIFF = os.path.join(os.path.dirname(sys.executable), "h5diff")
 
 
