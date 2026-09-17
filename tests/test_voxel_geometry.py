@@ -6,31 +6,36 @@ Tests for voxel_geometry.orient and voxel_geometry.film_geometry.
 Part 1 (pure numpy, exact): axis mapping of orient for normal_axis 0, 1, 2 on an
 asymmetric array, crop application, and rejection of bad arguments.
 
-Part 2 (Meep, run on a compute node): a 12 x 10 x 8 asymmetric voxel film (an
-L-shaped solid, solids joined across the periodic x and y seams, asymmetric seam
-voxels, single voxels on both film faces) is stored in (z, y, x) order with junk
-padding, cropped and oriented, and placed with film_geometry in a periodic cell
-(k_point = 0, PML in z only) at resolution = k / voxel_size, k = 1, 2, with
-do_averaging False and True.  Checks:
+Part 2 (Meep, run on a compute node): an asymmetric voxel film (an L-shaped
+solid, solids joined across the periodic x and y seams, asymmetric seam voxels,
+single voxels on both film faces) with even (12 x 10 x 8) and odd (13 x 11 x 8)
+lateral counts, placed with film_geometry (amendment A2 centre) in a periodic
+cell (k_point = 0) at resolution = k / voxel_size, k = 1, 2, do_averaging False
+(and True with --averaging_on).  Checks:
 
-  A. MaterialGrid sampling model.  sim.get_epsilon_grid() on the half-pixel
-     lattice (every Yee position) must equal a numpy model of a cell-centred,
-     trilinear, edge-clamped grid (max diff <= 1e-12) everywhere except on the
-     periodic seam planes x = -Lx/2, y = -Ly/2, where the value must equal one of
-     the two adjacent voxels (the side is reported).
-  B. sim.get_epsilon() over the film, each sample mapped to its voxel by its
-     coordinate: bulk samples (voxel and its 26 periodic neighbours of one phase)
-     must be exact (<= 1e-9), and such bulk samples must exist next to both
-     seams; with do_averaging=False the nearest-phase solid fraction must be
-     within FRACTION_TOL of the voxel solid fraction (reported only for True).  The fraction of samples whose epsilon differs from
-     the voxel value (> 1e-9) and the nearest-phase mismatch are reported.
-  C. Periodic wrap as translation invariance: the film rolled by whole voxels
-     in x and y must give the rolled epsilon; the fraction of samples that
-     differ is reported, and bulk samples must agree exactly.
-  D. (informational) the same array with odd lateral sizes (13 x 11 x 8):
-     fraction of get_epsilon() samples lying on a voxel face.
+  A. (averaging off) Yee nodes of E_x, E_y, E_z, modelled as (m or m + 1/2) / res
+     from the origin: fields.get_chi1inv at every node equals 1/eps of
+     get_epsilon_grid and of a cell-centred, trilinear, edge-clamped numpy
+     model (<= 1e-9) off the seam planes; no E_x (E_y) node lies on an x (y)
+     voxel face.  Reported: fraction of nodes on lateral faces per axis, seam
+     plane mismatch, fraction of face nodes carrying a solid/void blend.
+  B. get_epsilon() over one lateral period: no sample on a lateral voxel face,
+     bulk samples (voxel and 26 periodic neighbours of one phase) exact, and
+     (averaging off) nearest-phase solid fraction within FRACTION_TOL.
+  C. Periodic wrap: the film rolled by whole voxels in x and y.  get_epsilon
+     bulk samples must be identical; per component, every node whose chi1inv
+     differs from the rolled one must lie within half a voxel of a seam plane
+     (MaterialGrid's clamp zone).  Counts are reported.
 
-Exits nonzero on any failure.  Usage: test_voxel_geometry.py [--numpy-only]
+Part 3 (Meep): aligned_z_center for k = 1, 2 and cell heights with even, odd
+and non-integer pixel counts, three requested centres.  An independent sharp
+mp.Block probe locates the E_x z nodes; the shift must be <= 1/2 pixel, every
+voxel z face at (m + 1/2) / res, chi1inv at every z node equal to the model,
+no E_x / E_y z node on a voxel z face (no u = 1/2 value), and every z face on a
+get_epsilon() sample plane.  A control shifted by half a pixel reports the
+number of E_x nodes with u = 1/2.
+
+Exits nonzero on any failure.  Usage: test_voxel_geometry.py [--numpy-only] [--averaging_on] [--json FILE]
 
 Sam Dawley
 09/2026
@@ -160,81 +165,165 @@ def test_orient() -> None:
 			check(True, "orient rejects bad input (shape {0}, normal_axis {1})".format(np.shape(args[0]), args[1]))
 
 # ============================================================
-# PART 2: PLACEMENT (MEEP)
+# PART 2: LATERAL PLACEMENT (MEEP)
 # ============================================================
 
-def build_sim(a: np.ndarray, k: int, avg: bool):
-	"""Periodic x/y cell, PML in z, film centred at z = 0 with 6 vacuum voxels each side."""
+COMPONENTS = ("Ex", "Ey", "Ez")
+
+
+def block_min(n: int) -> float:
+	"""Lateral block minimum of film_geometry for n voxels (amendment A2 centre)."""
+	return -(n + n % 2)*VOXEL_SIZE/2
+
+
+def build_sim(a: np.ndarray, k: int, avg: bool, z_center: float = 0.0, cell_z: float = 0.0):
+	"""Periodic cell (k_point = 0), film from film_geometry at resolution k / VOXEL_SIZE; no fields are run."""
 	import meep as mp
 	assert k >= 1 and a.ndim == 3, "build_sim: bad arguments"
 	Lx, Ly, h, geom = vg.film_geometry(a, VOXEL_SIZE, mp.Medium(epsilon=EPS_SOLID), mp.Medium(epsilon=EPS_VOID),
-									   0.0, do_averaging=avg)
-	sim = mp.Simulation(cell_size=mp.Vector3(Lx, Ly, h + 12*VOXEL_SIZE), resolution=k/VOXEL_SIZE, geometry=geom,
-						k_point=mp.Vector3(), boundary_layers=[mp.PML(4*VOXEL_SIZE, direction=mp.Z)])
+									   z_center, do_averaging=avg)
+	cz = cell_z if cell_z > 0 else h + 12*VOXEL_SIZE
+	sim = mp.Simulation(cell_size=mp.Vector3(Lx, Ly, cz), resolution=k/VOXEL_SIZE, geometry=geom,
+						k_point=mp.Vector3())
 	sim.init_sim()
 	return sim
 
 
-def film_samples(sim, a: np.ndarray) -> Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray, np.ndarray], float]:
-	"""get_epsilon() restricted to one period of the film; voxel index per axis; fraction of samples on faces."""
+def lateral_nodes(n: int, k: int, half: bool) -> Tuple[np.ndarray, np.ndarray]:
+	"""Node coordinates of one lateral period on the Meep lattice (m or m + 1/2) / res.
+
+	Returns (voxel coordinate in [0, n) measured from the block minimum, query coordinate wrapped to [-L/2, L/2)).
+	"""
+	res = k/VOXEL_SIZE
+	b = block_min(n)
+	L = n*VOXEL_SIZE
+	m0 = int(np.ceil(b*res - (0.5 if half else 0.0) - 1e-9))
+	t = (m0 + np.arange(n*k) + (0.5 if half else 0.0))/res
+	u = (t - b)/VOXEL_SIZE
+	assert u.min() > -1e-9 and u.max() < n - 1e-9, "lateral_nodes: nodes outside one period"
+	q = (t + L/2) % L - L/2
+	return u, q
+
+
+def z_nodes(z_lo: float, z_hi: float, k: int, half: bool) -> np.ndarray:
+	"""Meep lattice coordinates (m or m + 1/2) / res in [z_lo, z_hi]."""
+	res = k/VOXEL_SIZE
+	s = 0.5 if half else 0.0
+	m = np.arange(int(np.ceil(z_lo*res - s - 1e-9)), int(np.floor(z_hi*res - s + 1e-9)) + 1)
+	return (m + s)/res
+
+
+def chi1inv_at(sim, comp: str, xs: np.ndarray, ys: np.ndarray, zs: np.ndarray) -> np.ndarray:
+	"""fields.get_chi1inv(comp, comp direction) at every grid point (xs x ys x zs)."""
+	import meep as mp
+	c, d = {"Ex": (mp.Ex, mp.X), "Ey": (mp.Ey, mp.Y), "Ez": (mp.Ez, mp.Z)}[comp]
+	out = np.empty((xs.size, ys.size, zs.size))
+	for i, x in enumerate(xs):
+		for j, y in enumerate(ys):
+			for l, z in enumerate(zs):
+				out[i, j, l] = np.real(sim.fields.get_chi1inv(c, d, mp.vec(float(x), float(y), float(z))))
+	return out
+
+
+def node_values(sim, a: np.ndarray, k: int, z_center: float) -> Dict:
+	"""Per component: node voxel coordinates, chi1inv at the nodes, 1/eps of get_epsilon_grid there, face masks."""
+	nx, ny, nz = a.shape
+	h = nz*VOXEL_SIZE
+	res = k/VOXEL_SIZE
+	out = {}
+	for comp in COMPONENTS:
+		ux, qx = lateral_nodes(nx, k, comp == "Ex")
+		uy, qy = lateral_nodes(ny, k, comp == "Ey")
+		zs = z_nodes(z_center - h/2 - 1.0/res, z_center + h/2 + 1.0/res, k, comp == "Ez")
+		uz = (zs - (z_center - h/2))/VOXEL_SIZE
+		ci = chi1inv_at(sim, comp, qx, qy, zs)
+		ox, oy = np.argsort(qx), np.argsort(qy)
+		eg = np.real(np.asarray(sim.get_epsilon_grid(qx[ox], qy[oy], zs)))
+		eg = eg[np.argsort(ox)][:, np.argsort(oy)]
+		out[comp] = {"ux": ux, "uy": uy, "uz": uz, "chi1inv": ci, "inv_eps_grid": 1.0/eg,
+					 "face_x": np.abs(ux - np.round(ux)) < 1e-6, "face_y": np.abs(uy - np.round(uy)) < 1e-6,
+					 "seam_x": np.abs(ux) < 1e-6, "seam_y": np.abs(uy) < 1e-6,
+					 # MaterialGrid clamps within half a voxel of the block edge instead of wrapping
+					 "clamp_x": np.minimum(ux, nx - ux) < 0.5 - 1e-9, "clamp_y": np.minimum(uy, ny - uy) < 0.5 - 1e-9}
+	return out
+
+
+def film_samples(sim, a: np.ndarray, k: int) -> Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray, np.ndarray], float]:
+	"""get_epsilon() over one lateral period of the film (coordinates wrapped into the block span); voxel index per axis."""
 	e = np.real(np.asarray(sim.get_epsilon()))
 	coords = [np.asarray(c, dtype=float) for c in sim.get_array_metadata()[:3]]
 	assert e.shape == tuple(c.size for c in coords), "get_epsilon / metadata shape mismatch"
 	sel, idx, on_face = [], [], []
-	for n, c in zip(a.shape, coords):
-		u = (c + 0.5*n*VOXEL_SIZE)/VOXEL_SIZE
-		keep = np.nonzero((u > -1e-9) & (u < n - 1e-9))[0]
+	for ax, (n, c) in enumerate(zip(a.shape, coords)):
+		if ax < 2:
+			L = n*VOXEL_SIZE
+			u = ((c - block_min(n)) % L)/VOXEL_SIZE
+			u = np.where(np.abs(u - n) < 1e-9, 0.0, u)
+			_, first = np.unique(np.round(u, 6), return_index=True)   # drop the duplicate ghost column
+			keep = np.sort(first)
+			keep = keep[np.argsort(u[keep])]
+		else:
+			u = (c + 0.5*n*VOXEL_SIZE)/VOXEL_SIZE
+			keep = np.nonzero((u > -1e-9) & (u < n - 1e-9))[0]
 		sel.append(keep)
 		idx.append(np.floor(u[keep] + 1e-9).astype(int))
 		on_face.append(np.abs(u[keep] - np.round(u[keep])) < 1e-6)
+	assert len(sel[0]) == k*a.shape[0] and len(sel[1]) == k*a.shape[1], "film_samples: expected k samples per voxel"
 	sub = e[np.ix_(*sel)]
-	face = on_face[0][:, None, None] | on_face[1][None, :, None] | on_face[2][None, None, :]
-	return sub, tuple(idx), float(np.mean(face))
+	face_lat = on_face[0][:, None, None] | on_face[1][None, :, None]
+	return sub, tuple(idx), float(np.mean(np.broadcast_to(face_lat, sub.shape)))
 
 
-def test_placement(k: int, avg: bool, out: Dict) -> None:
-	"""Checks A, B, C for one resolution multiple and averaging flag."""
+def test_placement(a: np.ndarray, k: int, avg: bool, out: Dict) -> None:
+	"""Lateral placement checks for one film shape, resolution multiple and averaging flag."""
 	assert vg.PROJECTION_BETA == 0.0, "material_model assumes no projection (beta = 0)"
-	a = synthetic_film()
 	nx, ny, nz = a.shape
-	tag = "k={0} do_averaging={1}".format(k, avg)
+	tag = "{0}x{1}x{2} k={3} do_averaging={4}".format(nx, ny, nz, k, avg)
 	sim = build_sim(a, k, avg)
 	rec: Dict = {"voxel_fraction": float(a.mean())}
-
-	# ----- A: MaterialGrid sampling model on every Yee position -----
 	w = a.astype(float)
-	fx = np.arange(2*k*nx)/(2*k)
-	fy = np.arange(2*k*ny)/(2*k)
-	fz = np.arange(2*k*nz + 1)/(2*k)
-	eg = np.real(np.asarray(sim.get_epsilon_grid(fx*VOXEL_SIZE - nx*VOXEL_SIZE/2, fy*VOXEL_SIZE - ny*VOXEL_SIZE/2,
-												  fz*VOXEL_SIZE - nz*VOXEL_SIZE/2)))
-	ug = (eg - EPS_VOID)/(EPS_SOLID - EPS_VOID)
-	um = material_model(w, fx, fy, fz)
-	d = np.abs(ug - um)
-	d_in = d[1:, 1:, :]
-	check(float(d_in.max()) <= 1e-12, "{0} A: get_epsilon_grid == cell-centred trilinear clamped model off the seams "
-		  "(max diff {1:.2e}, {2} points)".format(tag, float(d_in.max()), d_in.size))
-	seam_x = ug[0, :, :]
-	seam_y = ug[:, 0, :]
-	lo_x, hi_x = material_model(w, np.array([1e-9]), fy, fz)[0], material_model(w, np.array([nx - 1e-9]), fy, fz)[0]
-	lo_y, hi_y = material_model(w, fx, np.array([1e-9]), fz)[:, 0], material_model(w, fx, np.array([ny - 1e-9]), fz)[:, 0]
-	sx0, sx1 = float(np.abs(seam_x - lo_x).max()), float(np.abs(seam_x - hi_x).max())
-	sy0, sy1 = float(np.abs(seam_y - lo_y).max()), float(np.abs(seam_y - hi_y).max())
-	check(min(sx0, sx1) <= 1e-12 and min(sy0, sy1) <= 1e-12,
-		  "{0} A: seam planes take one adjacent voxel's clamped value (x=-Lx/2: vs voxel 0 {1:.3g}, vs voxel nx-1 {2:.3g}; "
-		  "y=-Ly/2: vs voxel 0 {3:.3g}, vs voxel ny-1 {4:.3g})".format(tag, sx0, sx1, sy0, sy1))
-	rec["seam_x_matches"] = "voxel 0" if sx0 <= 1e-12 else "voxel nx-1" if sx1 <= 1e-12 else "neither"
-	rec["seam_y_matches"] = "voxel 0" if sy0 <= 1e-12 else "voxel ny-1" if sy1 <= 1e-12 else "neither"
-	rec["yee_lattice_fraction"] = float(ug[:, :, 1:-1].mean())
+	bulk_vox = bulk_mask(a)
+
+	# ----- A: Yee nodes of every E component (do_averaging off: point sampling) -----
+	nodes = None
+	if not avg:
+		nodes = node_values(sim, a, k, 0.0)
+		rec["nodes"] = {}
+		for comp, nd in nodes.items():
+			ci, ie = nd["chi1inv"], nd["inv_eps_grid"]
+			seam = nd["seam_x"][:, None, None] | nd["seam_y"][None, :, None]
+			seam = np.broadcast_to(seam, ci.shape)
+			um = material_model(w, nd["ux"], nd["uy"], nd["uz"])
+			im = 1.0/(EPS_VOID + (EPS_SOLID - EPS_VOID)*um)
+			d_grid = np.abs(ci - ie)
+			d_model = np.abs(ci - im)
+			check(float(d_grid[~seam].max()) <= 1e-9 and float(d_model[~seam].max()) <= 1e-9,
+				  "{0} A {1}: chi1inv at modelled Yee nodes == 1/get_epsilon_grid == cell-centred trilinear model off the "
+				  "seam planes (max {2:.2e}, {3:.2e}; {4} nodes)".format(tag, comp, float(d_grid[~seam].max()),
+				  float(d_model[~seam].max()), int((~seam).sum())))
+			seam_grid = float(d_grid[seam].max()) if seam.any() else 0.0
+			seam_model = float(d_model[seam].max()) if seam.any() else 0.0
+			fx, fy = float(nd["face_x"].mean()), float(nd["face_y"].mean())
+			own = fx if comp == "Ex" else fy if comp == "Ey" else None
+			if own is not None:
+				check(own == 0.0, "{0} A {1}: no node on a voxel face along its own axis (fraction {2})".format(tag, comp, own))
+			face_nodes = np.broadcast_to(nd["face_x"][:, None, None] | nd["face_y"][None, :, None], ci.shape)
+			blend = face_nodes & (np.abs(um - np.round(um)) > 1e-9)
+			rec["nodes"][comp] = {"n_nodes": int(ci.size), "face_fraction_x": fx, "face_fraction_y": fy,
+								  "seam_node_fraction": float(seam.mean()), "seam_max_vs_grid": seam_grid,
+								  "seam_max_vs_model": seam_model, "blended_face_node_fraction": float(blend.mean())}
+			print("INFO {0} A {1}: nodes on lateral voxel faces: along x {2:.3f}, along y {3:.3f}; seam-plane nodes {4:.4f} "
+				  "(max |chi1inv - 1/eps_grid| {5:.3g}, vs clamped model {6:.3g}); face nodes with a solid/void blend {7:.4f}".format(
+				  tag, comp, fx, fy, float(seam.mean()), seam_grid, seam_model, float(blend.mean())), flush=True)
 
 	# ----- B: get_epsilon() over the film vs the voxel layout -----
-	e, (ix, iy, iz), face_frac = film_samples(sim, a)
+	e, (ix, iy, iz), face_frac = film_samples(sim, a, k)
 	check(face_frac == 0.0 and e.shape == (k*nx, k*ny, k*nz),
-		  "{0} B: {1} film samples, none on a voxel face (fraction on faces {2})".format(tag, e.shape, face_frac))
+		  "{0} B: {1} get_epsilon samples, none on a lateral voxel face (fraction {2})".format(tag, e.shape, face_frac))
 	ref_solid = a[np.ix_(ix, iy, iz)]
 	ref = np.where(ref_solid, EPS_SOLID, EPS_VOID)
 	diff = np.abs(e - ref)
-	bulk = bulk_mask(a)[np.ix_(ix, iy, iz)]
+	bulk = bulk_vox[np.ix_(ix, iy, iz)]
 	near_x = ((ix == 0) | (ix == nx - 1))[:, None, None] & bulk
 	near_y = ((iy == 0) | (iy == ny - 1))[None, :, None] & bulk
 	check(bool(near_x.any()) and bool(near_y.any()) and float(diff[bulk].max()) <= 1e-9,
@@ -248,10 +337,9 @@ def test_placement(k: int, avg: bool, out: Dict) -> None:
 				"linear_eps_fraction": float(((e - EPS_VOID)/(EPS_SOLID - EPS_VOID)).mean()),
 				"max_abs_diff": float(diff.max())})
 	print("INFO {0} B: exact mismatch (>1e-9) {1:.4f}; nearest-phase mismatch {2:.4f}; interface samples {3:.4f}; "
-		  "solid fraction voxel {4:.4f} nearest-phase {5:.4f} linear-eps {6:.4f} Yee-lattice material {7:.4f}".format(
+		  "solid fraction voxel {4:.4f} nearest-phase {5:.4f} linear-eps {6:.4f}".format(
 			  tag, rec["exact_mismatch_fraction"], rec["nearest_phase_mismatch_fraction"], rec["interface_sample_fraction"],
-			  rec["voxel_fraction"], rec["nearest_phase_fraction"], rec["linear_eps_fraction"], rec["yee_lattice_fraction"]),
-		  flush=True)
+			  rec["voxel_fraction"], rec["nearest_phase_fraction"], rec["linear_eps_fraction"]), flush=True)
 	frac_ok = abs(rec["nearest_phase_fraction"] - rec["voxel_fraction"]) <= FRACTION_TOL
 	frac_msg = "{0} B: nearest-phase solid fraction {1:.4f} within {2} of voxel fraction {3:.4f}".format(
 		tag, rec["nearest_phase_fraction"], FRACTION_TOL, rec["voxel_fraction"])
@@ -265,28 +353,133 @@ def test_placement(k: int, avg: bool, out: Dict) -> None:
 	rec["roll"] = {}
 	for sx, sy in ((5, 0), (0, 3), (7, 4)):
 		b = np.roll(np.roll(a, sx, 0), sy, 1)
-		e2, _, _ = film_samples(build_sim(b, k, avg), b)
+		sim2 = build_sim(b, k, avg)
+		e2, _, _ = film_samples(sim2, b, k)
 		rolled = np.roll(np.roll(e, sx*k, 0), sy*k, 1)
 		dd = np.abs(e2 - rolled)
 		bulk2 = np.roll(np.roll(bulk, sx*k, 0), sy*k, 1)
-		frac = float(np.mean(dd > 1e-9))
-		rec["roll"]["{0},{1}".format(sx, sy)] = {"differ_fraction": frac, "max_abs_diff": float(dd.max()),
-												 "nearest_phase_differ_fraction": float(np.mean(
-													 (e2 > 0.5*(EPS_SOLID + EPS_VOID)) != (rolled > 0.5*(EPS_SOLID + EPS_VOID))))}
+		r = {"get_epsilon_differ_fraction": float(np.mean(dd > 1e-9)), "get_epsilon_max_abs_diff": float(dd.max()),
+			 "nearest_phase_differ_fraction": float(np.mean(
+				 (e2 > 0.5*(EPS_SOLID + EPS_VOID)) != (rolled > 0.5*(EPS_SOLID + EPS_VOID))))}
 		check(float(dd[bulk2].max()) <= 1e-9,
-			  "{0} C: roll ({1},{2}) voxels: bulk samples identical (max {3:.2e}); all samples differ fraction {4:.4f}, "
-			  "max diff {5:.3f}, nearest-phase differ {6:.4f}".format(tag, sx, sy, float(dd[bulk2].max()), frac, float(dd.max()),
-			  rec["roll"]["{0},{1}".format(sx, sy)]["nearest_phase_differ_fraction"]))
+			  "{0} C: roll ({1},{2}) voxels: get_epsilon bulk samples identical (max {3:.2e}); all samples differ fraction "
+			  "{4:.4f}, max diff {5:.3f}, nearest-phase differ {6:.4f}".format(tag, sx, sy, float(dd[bulk2].max()),
+			  r["get_epsilon_differ_fraction"], r["get_epsilon_max_abs_diff"], r["nearest_phase_differ_fraction"]))
+		if nodes is not None:
+			nodes2 = node_values(sim2, b, k, 0.0)
+			for comp in COMPONENTS:
+				c1 = np.roll(np.roll(nodes[comp]["chi1inv"], sx*k, 0), sy*k, 1)
+				c2 = nodes2[comp]["chi1inv"]
+				dn = np.abs(c2 - c1) > 1e-9
+				shp = dn.shape
+				def zone(nd, key):
+					return np.broadcast_to(nd[key + "_x"][:, None, None] | nd[key + "_y"][None, :, None], shp)
+				def rolled(m):
+					return np.roll(np.roll(m, sx*k, 0), sy*k, 1)
+				# nodes that are, before or after the roll, on a seam plane / inside the half-voxel clamp zone
+				plane = zone(nodes2[comp], "seam") | rolled(zone(nodes[comp], "seam"))
+				clamp = zone(nodes2[comp], "clamp") | rolled(zone(nodes[comp], "clamp"))
+				outside = dn & ~clamp
+				r[comp] = {"differ_fraction": float(dn.mean()), "differ_count": int(dn.sum()),
+						   "differ_on_seam_plane": int((dn & plane).sum()), "differ_in_clamp_zone": int((dn & clamp).sum()),
+						   "differ_outside_clamp_zone": int(outside.sum())}
+				print("INFO {0} C: roll ({1},{2}) {3} nodes differ: {4} of {5} ({6:.4f}); on a seam plane {7}; within half a "
+					  "voxel of a seam (clamp zone) {8}; elsewhere {9}".format(tag, sx, sy, comp, int(dn.sum()), dn.size,
+					  float(dn.mean()), int((dn & plane).sum()), int((dn & clamp).sum()), int(outside.sum())), flush=True)
+				check(int(outside.sum()) == 0, "{0} C: roll ({1},{2}) {3}: every differing node lies within half a voxel "
+					  "of a seam plane".format(tag, sx, sy, comp))
+		rec["roll"]["{0},{1}".format(sx, sy)] = r
 	out[tag] = rec
 
+# ============================================================
+# PART 3: Z ALIGNMENT (MEEP)
+# ============================================================
 
-def test_odd_sizes(out: Dict) -> None:
-	"""Informational: odd lateral voxel counts, fraction of get_epsilon() samples on voxel faces."""
-	a = synthetic_film(13, 11, 8)
-	for k in (1, 2):
-		_, _, face_frac = film_samples(build_sim(a, k, False), a)
-		print("INFO odd 13x11x8 k={0}: fraction of film samples on a voxel face = {1:.4f}".format(k, face_frac), flush=True)
-		out["odd13x11x8 k={0}".format(k)] = {"face_sample_fraction": face_frac}
+def probe_ex_z_nodes(cell_z: float, k: int) -> Tuple[float, float]:
+	"""Locate the E_x nodes bracketing a sharp mp.Block face (eps_averaging off) from get_chi1inv interpolation."""
+	import meep as mp
+	res = k/VOXEL_SIZE
+	z0 = 0.0137 + 0.37/res
+	sim = mp.Simulation(cell_size=mp.Vector3(2*VOXEL_SIZE, 2*VOXEL_SIZE, cell_z), resolution=res, eps_averaging=False,
+						k_point=mp.Vector3(), geometry=[mp.Block(center=mp.Vector3(0, 0, z0 + 0.25*cell_z),
+						size=mp.Vector3(mp.inf, mp.inf, 0.5*cell_z), material=mp.Medium(epsilon=EPS_SOLID))])
+	sim.init_sim()
+	qs = (np.floor(z0*res) + np.arange(-40, 41)/20.0)/res
+	v = np.array([np.real(sim.fields.get_chi1inv(mp.Ex, mp.X, mp.vec(0.0, 0.0, float(q)))) for q in qs])
+	below = float(qs[np.nonzero(np.abs(v - 1.0) < 1e-12)[0].max()])
+	above = float(qs[np.nonzero(np.abs(v - 1.0/EPS_SOLID) < 1e-12)[0].min()])
+	return below*res, above*res
+
+
+def test_z_alignment(k: int, cell_z: float, out: Dict) -> None:
+	"""aligned_z_center: faces midway between E_x/E_y nodes, verified with Meep for one cell height."""
+	res = k/VOXEL_SIZE
+	npx = int(np.floor(cell_z*res + 0.5))
+	tag = "z-align k={0} cell_z={1:g} ({2} px, {3})".format(k, cell_z, npx, "odd" if npx % 2 else "even")
+	prof = np.array([1, 1, 0, 1, 1, 1, 0, 0, 1, 1], dtype=bool)
+	a = np.broadcast_to(prof, (4, 4, prof.size)).copy()
+	h = prof.size*VOXEL_SIZE
+	rec: Dict = {"cell_pixels": npx}
+
+	# node lattice for this cell (independent probe)
+	lo, hi = probe_ex_z_nodes(cell_z, k)
+	check(abs(lo - round(lo)) < 1e-9 and abs(hi - lo - 1.0) < 1e-9,
+		  "{0}: probe E_x z nodes bracketing a block face at {1:.4f} and {2:.4f} px (integers, one pixel apart)".format(tag, lo, hi))
+
+	for requested in (0.0137, -0.0213, 0.0):
+		zc = vg.aligned_z_center(requested, h, res, cell_z)
+		shift_px = (zc - requested)*res
+		faces_px = (zc - h/2 + np.arange(prof.size + 1)*VOXEL_SIZE)*res
+		arith = float(np.abs(faces_px - np.floor(faces_px) - 0.5).max())
+		check(abs(shift_px) <= 0.5 + 1e-9 and arith < 1e-6,
+			  "{0} request {1:+.4f}: shift {2:+.4f} px (<= 0.5), every z face at m + 1/2 px (max dev {3:.1e})".format(
+				  tag, requested, shift_px, arith))
+		sim = build_sim(a, k, False, z_center=zc, cell_z=cell_z)
+		nd = node_values(sim, a, k, zc)
+		for comp in COMPONENTS:
+			ci = nd[comp]["chi1inv"]
+			uz = nd[comp]["uz"]
+			um = material_model(a.astype(float), nd[comp]["ux"], nd[comp]["uy"], uz)
+			im = 1.0/(EPS_VOID + (EPS_SOLID - EPS_VOID)*um)
+			dm = float(np.abs(ci - im).max())
+			zface_vox = np.abs(uz - np.round(uz)) < 1e-6
+			outer = (np.abs(uz) < 1e-6) | (np.abs(uz - prof.size) < 1e-6)
+			half = np.abs(um - 0.5) < 1e-9
+			dm = float(np.abs(ci - im)[:, :, ~outer].max())
+			check(dm <= 1e-9, "{0} request {1:+.4f} {2}: chi1inv at z nodes == trilinear model, outer film faces excluded "
+				  "(max {3:.2e})".format(tag, requested, comp, dm))
+			if outer.any():
+				u_meep = (1.0/ci[:, :, outer] - EPS_VOID)/(EPS_SOLID - EPS_VOID)
+				print("INFO {0} request {1:+.4f} {2}: nodes exactly on the outer film faces (block boundary) have u = {3} "
+					  "(bottom, top; model clamps to the edge voxel: {4})".format(tag, requested, comp,
+					  [round(float(v), 6) for v in u_meep[0, 0]], [round(float(v), 6) for v in um[0, 0, outer]]), flush=True)
+			if comp in ("Ex", "Ey"):
+				check(not zface_vox.any() and not half.any(),
+					  "{0} request {1:+.4f} {2}: no z node on a voxel z face and no u = 1/2 value ({3} nodes, u values {4})".format(
+						  tag, requested, comp, uz.size, sorted(set(np.round(um.ravel(), 4)))))
+			else:
+				print("INFO {0} request {1:+.4f} Ez: fraction of z nodes on voxel z faces {2:.3f}".format(
+					tag, requested, float(zface_vox.mean())), flush=True)
+		# get_epsilon (centred grid) z coordinates: faces coincide with samples (midway between E_x nodes)
+		zc_meta = np.asarray(sim.get_array_metadata()[2], dtype=float)
+		hit = [bool(np.min(np.abs(zc_meta - f/res)) < 1e-9) for f in faces_px]
+		e = np.real(np.asarray(sim.get_epsilon()))
+		check(all(hit), "{0} request {1:+.4f}: every z face coincides with a get_epsilon sample plane".format(tag, requested))
+		# negative control: faces on the nodes (unaligned) give u = 1/2 at E_x nodes
+		zc_bad = zc + 0.5/res
+		nd_bad = node_values(build_sim(a, k, False, z_center=zc_bad, cell_z=cell_z), a, k, zc_bad)
+		um_bad = material_model(a.astype(float), nd_bad["Ex"]["ux"], nd_bad["Ex"]["uy"], nd_bad["Ex"]["uz"])
+		rec["request {0:+.4f}".format(requested)] = {"z_center": zc, "shift_px": shift_px,
+			"Ex_nodes_u_half_aligned": 0, "Ex_nodes_u_half_control": int(np.sum(np.abs(um_bad - 0.5) < 1e-9)),
+			"get_epsilon_film_mean": float(e.mean())}
+		print("INFO {0} request {1:+.4f}: control (film +0.5 px, faces on E_x nodes): {2} E_x nodes with u = 1/2".format(
+			tag, requested, rec["request {0:+.4f}".format(requested)]["Ex_nodes_u_half_control"]), flush=True)
+	try:
+		vg.aligned_z_center(0.0, 2*cell_z, res, cell_z)
+		check(False, "{0}: aligned_z_center rejects a film taller than the cell".format(tag))
+	except ValueError:
+		check(True, "{0}: aligned_z_center rejects a film taller than the cell".format(tag))
+	out[tag] = rec
 
 # ============================================================
 # __main__
@@ -299,6 +492,7 @@ if __name__ == "__main__":
 	# ----- optional -----
 	parser.add_argument("--numpy-only", action="store_true", help="run only the orient tests")
 	parser.add_argument("--json", type=str, default="", help="write the numbers to this JSON file")
+	parser.add_argument("--averaging_on", action="store_true", help="also run the placement checks with do_averaging=True")
 
 	args = parser.parse_args()
 
@@ -318,10 +512,13 @@ if __name__ == "__main__":
 		crop = [[2, 2 + stored.shape[0]], [1, 1 + stored.shape[1]], [3, 3 + stored.shape[2]]]
 		check(np.array_equal(vg.orient(padded, 0, crop), synthetic_film()),
 			  "orient(padded stored film, 0, crop) reproduces the [x, y, z] test film")
+		for shape in ((12, 10, 8), (13, 11, 8)):
+			for k in (1, 2):
+				for avg in ((False, True) if args.averaging_on else (False,)):
+					test_placement(synthetic_film(*shape), k, avg, results)
 		for k in (1, 2):
-			for avg in (False, True):
-				test_placement(k, avg, results)
-		test_odd_sizes(results)
+			for extra in (0.0, 1.0, 0.5):
+				test_z_alignment(k, 0.30 + extra*VOXEL_SIZE/k, results)
 		if args.json:
 			with open(args.json, "w") as fh:
 				json.dump(results, fh, indent=1)
