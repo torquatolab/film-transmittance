@@ -85,8 +85,66 @@ def _flux_metadata_path(sim, stem):
 	return "{0}-{1}.meta.json".format(prefix, stem) if prefix else stem + ".meta.json"
 
 
-def _require_matching_flux_layout(sim, stem):
-	"""Refuse a reference flux written with an unknown or different rank count."""
+VOXEL_SUFFIXES = ('.npz', '.tif', '.tiff')
+# Reference-metadata keys that must match between the -ref and the sample run.
+GEOMETRY_META_KEYS = ('voxel_sha256', 'crop', 'voxel_size', 'normal_axis', 'cell')
+
+
+def _is_voxel_input(load):
+	"""True when -load names a voxel array (.npz/.tif/.tiff) rather than a pattern file."""
+	return os.path.splitext(load)[1].lower() in VOXEL_SUFFIXES
+
+
+def _parse_crop(text):
+	"""Parse -crop 'z0:z1,y0:y1,x0:x1' (stored axis order, half-open) into [[s, e], ...]."""
+	parts = text.split(',')
+	if len(parts) != 3:
+		raise ValueError("expected three comma-separated ranges s:e, got {0!r}".format(text))
+	crop = []
+	for part in parts:
+		bounds = part.split(':')
+		if len(bounds) != 2:
+			raise ValueError("range {0!r} is not of the form s:e".format(part))
+		start, stop = int(bounds[0]), int(bounds[1])
+		if not 0 <= start < stop:
+			raise ValueError("range {0!r} needs 0 <= s < e".format(part))
+		crop.append([start, stop])
+	return crop
+
+
+def _fields_mode(args):
+	"""Volume-DFT output mode; getattr keeps it valid before and after the P4 flags exist."""
+	return ("none" if getattr(args, "no_fields", False)
+			else "selected" if getattr(args, "field_wavelengths", None) else "all")
+
+
+def _geometry_mismatches(metadata, geometry_meta, voxel_input):
+	"""List human-readable differences between a reference's metadata and this run.
+
+	Values are compared after a JSON round trip, i.e. exactly as the reference wrote
+	them (Python floats survive json.dump/json.load bit for bit).  A key absent from
+	an old reference is a mismatch only for voxel input, where the cell comes from
+	data the old reference cannot vouch for.
+	"""
+	problems = []
+	current = json.loads(json.dumps({k: geometry_meta[k] for k in GEOMETRY_META_KEYS}))
+	for key in GEOMETRY_META_KEYS:
+		if key not in metadata:
+			if voxel_input:
+				problems.append("{0} missing from the reference (written before voxel input?)".format(key))
+			continue
+		if metadata[key] != current[key]:
+			problems.append("{0}: reference {1!r}, current {2!r}".format(
+				key, metadata[key], current[key]))
+	return problems
+
+
+def _require_matching_flux_layout(sim, stem, geometry_meta=None, voxel_input=False):
+	"""Refuse a reference flux written with an unknown or different rank count.
+
+	With geometry_meta, also refuse a reference whose voxel_sha256, crop, voxel_size,
+	normal_axis or cell differ from this run (see _geometry_mismatches).
+	"""
 	path = _flux_metadata_path(sim, stem)
 	ok = True
 	if mp.am_master():
@@ -106,6 +164,13 @@ def _require_matching_flux_layout(sim, stem):
 					"REFUSING: {0} was written by {1} ranks, current run has {2}. "
 					"Meep silently mis-frames a mismatched flux reference.\n".format(
 						path, written_nprocs, current_nprocs))
+			if geometry_meta is not None:
+				problems = _geometry_mismatches(metadata, geometry_meta, voxel_input)
+				if problems:
+					ok = False
+					sys.stderr.write(
+						"REFUSING: {0} describes a different structure or cell: {1}\n".format(
+							path, "; ".join(problems)))
 	ok = mp.broadcast(0, ok)
 	if not ok:
 		raise SystemExit("aborting: unverified or mismatched reference-flux layout")
@@ -132,6 +197,38 @@ def main(args):
 	print(args.comp)
 
 	h = args.tfilm
+	voxel_input = _is_voxel_input(args.load)
+	geometry_meta = {"voxel_sha256": None, "crop": None, "voxel_size": None,
+					 "normal_axis": None, "eps": str(args.eps), "eps_ref": str(args.eps_ref),
+					 "fields_mode": _fields_mode(args)}
+	if voxel_input:
+		# The film thickness and the lateral cell come from the data, so the voxels are
+		# loaded before any z position is derived from h.  Imported here so runs without
+		# voxel input never import these modules.
+		import voxel_io
+		import voxel_geometry
+		print("Load a voxel array in ", args.load)
+		try:
+			voxels, provenance = voxel_io.load_voxels(args.load, key=args.voxel_key)
+		except ValueError as exc:
+			raise SystemExit("ERROR: cannot load voxel input {0}: {1}".format(args.load, exc))
+		if args.crop is not None:
+			for axis, (start, stop) in enumerate(args.crop):
+				if stop > voxels.shape[axis]:
+					raise SystemExit("ERROR: -crop range {0}:{1} exceeds stored axis {2} of "
+						"length {3}".format(start, stop, axis, voxels.shape[axis]))
+		oriented = voxel_geometry.orient(voxels, normal_axis=args.normal_axis, crop=args.crop)
+		del voxels
+		h = args.voxel_size*oriented.shape[2]
+		if args.tfilm_given and abs(args.tfilm - h) > 1e-9:
+			raise SystemExit("ERROR: -tfilm {0:g} differs from the voxel data thickness "
+				"{1:.12g} (= voxel_size x {2} layers); omit -tfilm for voxel input".format(
+					args.tfilm, h, oriented.shape[2]))
+		print("voxel array: stored shape {0}, oriented [x,y,z] shape {1}, solid fraction "
+			"{2:.6f}, sha256 {3}".format(provenance["shape"], list(oriented.shape),
+				float(np.mean(oriented)), provenance["sha256"]))
+		geometry_meta.update(voxel_sha256=provenance["sha256"], crop=args.crop,
+							 voxel_size=args.voxel_size, normal_axis=args.normal_axis)
 	PML_thickness = args.tpml*wavelen_max
 	
 	# Global Z positions (bottom of film at z=0)
@@ -149,16 +246,45 @@ def main(args):
 	pos_source = z_pos_source - z_center_offset
 	pos_detector2 = z_pos_detector2 - z_center_offset
 	film_z_center = 0.5*h - z_center_offset
+	if voxel_input:
+		# Amendment A3: move the film (not the source or the flux monitors) by at most half
+		# a pixel so its z faces lie midway between grid nodes.  Everything tied to the film
+		# position below (the block, the DFT analysis volume, the _z.npy coordinates) uses
+		# the shifted centre.  -ref computes the same shift, so reference and sample agree.
+		_px_per_voxel = args.res*args.voxel_size
+		if abs(_px_per_voxel - round(_px_per_voxel)) > 1e-9*max(1.0, abs(_px_per_voxel)):
+			print("WARNING: -res x -voxel_size = {0:.12g} is not an integer; interior voxel "
+				"faces will not align with the Meep grid".format(_px_per_voxel), flush=True)
+		_unaligned_z_center = film_z_center
+		film_z_center = voxel_geometry.aligned_z_center(film_z_center, h, args.res, cell_height)
+		print("voxel film z centre: {0:.12g} -> {1:.12g} (shift {2:+.3e} = {3:+.4f} px) so the "
+			"film z faces lie midway between grid nodes".format(_unaligned_z_center, film_z_center,
+				film_z_center - _unaligned_z_center, (film_z_center - _unaligned_z_center)*args.res))
+		geometry_meta.update(film_z_center=float(film_z_center),
+							 film_z_shift=float(film_z_center - _unaligned_z_center))
 
 	#generate header and geometry -----#
 	header = GenerateHeader (args)
+	if voxel_input:
+		header = header.replace('a custom disk/square packing', 'a voxel array')
 
 	geometry = []
 	Lx, Ly = 1.0, 1.0 # Default if load is empty
 	print("Geometry:")
 	if args.load != '':
 		postfix = args.load.split('.')[-1]
-		if (postfix == 'Dispersion'):
+		if voxel_input:
+			# Weight 1 = solid (-eps), 0 = void (-eps_ref); one MaterialGrid block per film.
+			[Lx, Ly, h_grid, geometry] = voxel_geometry.film_geometry(
+				oriented, args.voxel_size, eps_pol, eps_ref, film_z_center,
+				do_averaging=args.interface_averaging)
+			del oriented
+			if abs(h_grid - h) > 1e-9:
+				raise SystemExit("ERROR: film_geometry thickness {0!r} differs from the "
+					"thickness {1!r} used for the cell".format(h_grid, h))
+			print("voxel film: Lx = {0:.6g}, Ly = {1:.6g}, h = {2:.6g}, interface "
+				"averaging {3}".format(Lx, Ly, h, args.interface_averaging))
+		elif (postfix == 'Dispersion'):
 			# Polygonal packing
 			print("Load a polygonal packing in ", args.load)
 			# Continuing would simulate an empty cell and report T = 1 as a result.
@@ -183,6 +309,7 @@ def main(args):
 		if args.ref:
 			geometry = []			
 		
+	geometry_meta["cell"] = [float(Lx), float(Ly), float(h)]
 	Courant_parameter = DetermineCourantFactor(args, eps_pol, eps_ref, dimension)
 	print("Courant parameter = {0:0.3f}\n".format(Courant_parameter))
 
@@ -355,7 +482,16 @@ def main(args):
 			comps_ = args.comp if args.JouleHeating == False else ['Ex','Ey','Ez',"Dx","Dy", "Dz"]
 			comps = [component_map[c] for c in comps_]
 
-			dft_field = sim.add_dft_fields(comps, fcen, fwidth, NumFreqs, where=nonpml_vol, yee_grid=False) if args.JouleHeating else sim.add_dft_fields(comps, fcen, fwidth, NumFreqs, where=nonpml_vol) 
+			# Volume DFT: every -nfreqs bin (default), only the -field_wavelengths
+			# frequencies, or none at all (-no_fields).  Without it the DFT-decay stopping
+			# condition sees only the flux monitors; with a frequency subset Meep's
+			# automatic decimation (from the largest monitored frequency) can differ.
+			if args.no_fields:
+				dft_field = None
+			elif args.field_wavelengths:
+				dft_field = sim.add_dft_fields(comps, [1.0/wl_ for wl_ in args.field_wavelengths], where=nonpml_vol)
+			else:
+				dft_field = sim.add_dft_fields(comps, fcen, fwidth, NumFreqs, where=nonpml_vol, yee_grid=False) if args.JouleHeating else sim.add_dft_fields(comps, fcen, fwidth, NumFreqs, where=nonpml_vol) 
 			
 			# Use provided tempname; otherwise, fall back to basename of saveas
 			temp_name = args.tempname if args.tempname != "" else args.saveas.split('/')[-1]
@@ -383,7 +519,8 @@ def main(args):
 							print("salvage: intentionally replaying the old reference "
 								  "without a rank-layout check", flush=True)
 					else:
-						_require_matching_flux_layout(sim, temp_name+'refl-flux')
+						_require_matching_flux_layout(sim, temp_name+'refl-flux',
+							geometry_meta, voxel_input)
 					sim.load_minus_flux(temp_name+'refl-flux', refl)
 				else:
 					print("reference run for scattering power calculation\n")
@@ -495,7 +632,8 @@ def main(args):
 				del _t
 				# The good reference is the one place a layout check still bites: it was
 				# written by a different job, so its rank count is not guaranteed.
-				_require_matching_flux_layout(sim, args.salvage_goodref)
+				_require_matching_flux_layout(sim, args.salvage_goodref,
+					geometry_meta, voxel_input)
 				sim.load_flux(args.salvage_goodref, refl)          # - I_true
 				_t = sim.get_flux_data(refl)
 				_Ec -= _t.E; _Hc -= _t.H
@@ -677,18 +815,29 @@ def main(args):
 					_abort_if_write_failed(
 						_master_save(_write_json,
 							_flux_metadata_path(sim, temp_name+'refl-flux'),
-							{"nprocs": mp.count_processors(), "tempname": temp_name,
-							 "resolution": args.res}),
+							dict({"nprocs": mp.count_processors(), "tempname": temp_name,
+								  "resolution": args.res}, **geometry_meta)),
 						"reference-flux metadata write")
 				
 			else: 
 				# write dft fields 
-				print("saving dft files...\n")
 				Absorption = np.zeros(NumFreqs)
 				_dft_ok = True
-				for i in range(NumFreqs):
-					k_exact = kmin + (kmax-kmin)*i/(NumFreqs-1)
-					k_i = np.round(k_exact*10000)/10000   # file names only
+				# (DFT bin, k for the file name, exact k) of every volume-DFT bin to save
+				if args.no_fields:
+					print("-no_fields: no dft files\n")
+					field_bins = []
+				elif args.field_wavelengths:
+					print("saving dft files (-field_wavelengths)...\n")
+					field_bins = [(j, round(2.0*np.pi/wl_, 4), 2.0*np.pi/wl_)
+								  for j, wl_ in enumerate(args.field_wavelengths)]
+				else:
+					print("saving dft files...\n")
+					field_bins = [(i, None, kmin + (kmax-kmin)*i/(NumFreqs-1))
+								  for i in range(NumFreqs)]
+				for i, k_i, k_exact in field_bins:
+					if k_i is None:
+						k_i = np.round(k_exact*10000)/10000   # file names only
 					name = "{0}__ka-{1:.04f}-{2}.npy"
 
 					# store relevant field components
@@ -837,7 +986,79 @@ if __name__ == '__main__':
 
 	parser.add_argument('-particle', type=str, default='disk', help='particle shape')
 
+	# --- field output (P4) ---
+	parser.add_argument('-no_fields', action='store_true', default=False,
+		help='skip the volume DFT: no __ka-* field arrays are written (the _x/_y/_z/_w '
+			 'metadata and the T/R table still are); needs -ScattPower')
+	parser.add_argument('-field_wavelengths', type=float, nargs='+', default=None,
+		help='volume DFT only at these wavelengths (um), freq = 1/lambda exactly; files '
+			 'are named __ka-{round(2*pi/lambda, 4)}')
+	# --- end field output (P4) ---
+
+	# --- voxel input (I1) ---
+	# A -load ending in .npz/.tif/.tiff is a 3D voxel array (True = solid = -eps, False =
+	# void = -eps_ref) instead of a 2D pattern; Lx, Ly and the film thickness come from it.
+	parser.add_argument('-voxel_size', type=float, default=None, help='voxel input: edge length of one voxel in micrometers (required, > 0)')
+	parser.add_argument('-normal_axis', type=int, default=0, help='voxel input: stored axis along the film normal (default: 0)')
+	parser.add_argument('-voxel_key', type=str, default='g', help='voxel input: array name inside an .npz file (default: g)')
+	parser.add_argument('-crop', type=str, default=None, help='voxel input: z0:z1,y0:y1,x0:x1 crop in STORED axis order, half-open (default: none)')
+	parser.add_argument('-interface_averaging', action='store_true', default=False, help='voxel input: MaterialGrid subpixel averaging (do_averaging=True)')
+	# None marks "-tfilm not given"; it is replaced by the 0.1 default right after parsing,
+	# so runs without voxel input see exactly the same value as before.
+	parser.set_defaults(tfilm=None)
+	# --- end voxel input (I1) ---
+
 	args = parser.parse_args()
+	# --- voxel input (I1) ---
+	args.tfilm_given = args.tfilm is not None
+	if not args.tfilm_given:
+		args.tfilm = 0.1
+	if _is_voxel_input(args.load):
+		_bad = []
+		if args.voxel_size is None or not args.voxel_size > 0:
+			_bad.append("-voxel_size > 0 is required (got {0})".format(args.voxel_size))
+		if args.is_point:
+			_bad.append("-is_point does not apply")
+		if args.phi > 0:
+			_bad.append("-phi {0:g} does not apply (the solid fraction comes from the data)".format(args.phi))
+		if args.scale2sim != 1:
+			_bad.append("-scale2sim {0:g} is not supported (must be 1)".format(args.scale2sim))
+		if args.normal_axis not in (0, 1, 2):
+			_bad.append("-normal_axis must be 0, 1 or 2 (got {0})".format(args.normal_axis))
+		if args.crop is not None:
+			try:
+				args.crop = _parse_crop(args.crop)
+			except ValueError as exc:
+				_bad.append("-crop: {0}".format(exc))
+		if _bad:
+			raise SystemExit("voxel input {0}: {1}".format(args.load, "; ".join(_bad)))
+	else:
+		_given = [f for f, v in (('-voxel_size', args.voxel_size is not None),
+								 ('-crop', args.crop is not None),
+								 ('-interface_averaging', args.interface_averaging)) if v]
+		if _given:
+			raise SystemExit("{0} only apply to voxel input (-load .npz/.tif/.tiff)".format(", ".join(_given)))
+	# --- end voxel input (I1) ---
+	# --- field output (P4) ---
+	# Rejected before main() builds the simulation.
+	if args.no_fields and args.field_wavelengths:
+		raise SystemExit("-no_fields and -field_wavelengths are mutually exclusive")
+	if args.JouleHeating and (args.no_fields or args.field_wavelengths):
+		raise SystemExit("-JouleHeating needs the full volume DFT; it cannot be combined "
+			"with {0}".format("-no_fields" if args.no_fields else "-field_wavelengths"))
+	if args.no_fields and not args.ScattPower:
+		# No DFT object at all: nothing would be computed, and Meep's DFT-decay stopping
+		# condition divides by the (zero) maximum DFT frequency.
+		raise SystemExit("-no_fields requires -ScattPower (otherwise nothing is computed)")
+	if args.field_wavelengths:
+		if not all(np.isfinite(wl_) and wl_ > 0 for wl_ in args.field_wavelengths):
+			raise SystemExit("-field_wavelengths must be finite and positive (got {0})".format(
+				args.field_wavelengths))
+		_knames = ["{0:.4f}".format(round(2.0*np.pi/wl_, 4)) for wl_ in args.field_wavelengths]
+		if len(set(_knames)) != len(_knames):
+			raise SystemExit("-field_wavelengths {0} give duplicate file names ka-{1}".format(
+				args.field_wavelengths, _knames))
+	# --- end field output (P4) ---
 	# Cheap argument checks, all before main() spends time building the simulation.
 	if args.Z2:
 		raise SystemExit("-Z2 is not implemented in this script; pass a -load file")

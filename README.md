@@ -6,8 +6,8 @@ patterned with a periodic 2D array of disks or squares. The pattern is extruded
 along z through the film thickness. Boundaries are periodic in x/y, with PML in
 z; a normally incident plane wave travels toward negative z. Particles may be
 metals (Ag, Au, Cu) or dielectrics. It models an infinite periodic film, not an
-isolated object or arbitrary 3D mesh. For a general 3D structure, replace the
-geometry construction in `main()` and adapt the cell, source, and monitors.
+isolated object. A 3D voxel array (`.npz` or `.tif`) can also be used as the
+film; see "Voxel input" below.
 
 | File | Purpose |
 |---|---|
@@ -15,6 +15,10 @@ geometry construction in `main()` and adapt the cell, source, and monitors.
 | `film_fdtd_utils.py` | Helpers: pattern-file readers, geometry, materials, Courant factor, stopping condition |
 | `run_spectrum.sh` | Runs the reference and sample stages with shared settings |
 | `della.slurm` | Princeton Della batch template for `run_spectrum.sh` |
+| `voxel_io.py` | Voxel input: reads `.npz`/`.tif` arrays, checks JSON sidecar fractions |
+| `voxel_geometry.py` | Voxel input: axis orientation, crop, MaterialGrid film, grid alignment |
+| `voxel_crop.py` | Chooses the lateral crop of a non-periodic stack with the best-matching faces |
+| `tests/` | Validation scripts and Della job files used to check the voxel input (see `tests/README.md`) |
 | `examples/one_disk.txt` | Example pattern: one disk per square unit cell |
 | `patches/` | Optional Meep patch and installer needed for checkpoint/restart |
 | `environment.yml` | Conda environment with MPI-enabled Meep 1.31.0 |
@@ -114,6 +118,47 @@ resolution, PML/separations, and DFT tolerance until the spectrum is stable.
 it produces output without proving convergence. The log then contains a
 `WARNING: run reached the -maxt ... ceiling` line; increase the ceiling if so.
 
+## Voxel input
+
+`-load` with a `.npz` (array under `-voxel_key`, default `g`), `.tif`, or `.tiff`
+file uses a 3D binary array as the whole film instead of an extruded pattern.
+Nonzero voxels are solid (`-eps`); zero voxels are the matrix (`-eps_ref`);
+outside the film is vacuum. `-voxel_size` (micrometers per voxel) is required.
+The film normal is stored axis `-normal_axis` (default 0, the frame axis of a
+TIFF stack); the other two axes become y and x in stored order. Lx, Ly, and the
+thickness come from the array, so `-tfilm`, `-phi`, `-is_point`, and
+`-scale2sim` do not apply. `-crop z0:z1,y0:y1,x0:x1` (stored axis order,
+half-open) simulates a sub-block. A JSON sidecar next to an `.npz` is checked:
+the solid fraction must match `phi1_realized`, or else `phi2_realized`.
+
+```bash
+INPUT=path/structure.npz VOXEL_SIZE=0.01 bash run_spectrum.sh results-voxel
+INPUT=stack.tif VOXEL_SIZE=0.01 CROP=0:258,0:57,16:134 bash run_spectrum.sh results-tif
+```
+
+The array is placed with `mp.MaterialGrid`, one sample per voxel. Use
+`-res` equal to an integer multiple of `1/voxel_size`: the lateral block centre
+and the film z position are shifted by at most half a pixel so voxel faces lie
+midway between grid nodes (the log prints the shift). Keep
+`-interface_averaging` off; it was less accurate in every test. The x/y
+boundaries are periodic, so the array is treated as one period of an infinite
+film. For stacks that are not periodic, `voxel_crop.best_crop()` finds the
+lateral crop whose opposite faces match best. `-no_fields` skips the volume
+field arrays (spectra only); `-field_wavelengths` saves them only at listed
+wavelengths. Reference and sample runs must use the same file, crop, voxel
+size, and normal axis; the sample run refuses a reference that differs.
+
+**Known limitations (validation of 2026-09-17; the defaults are being revised).**
+For cells whose lateral period exceeds the wavelength, the default z padding
+(`-ddet 0.2 -dpml 0.3 -tpml 0.5`) is not adequate: a periodic unit cell gave an
+unphysical T = -0.052 near a diffraction cutoff, and a TIFF crop grew without
+bound after t ~ 250. `-tpml 1.5` removed both. Runs of these structures do not
+meet the DFT stopping criterion and stop at `-maxt`, so the ceiling must be
+chosen and checked per structure family. Spectra of cropped non-periodic
+stacks depend on the lateral boundary treatment by about 0.02 in T on average
+(up to about 0.2 at sharp resonances), and 101 frequencies under-resolve their
+narrow features.
+
 ## Checkpoints: continue an interrupted calculation
 
 Checkpoints save the simulation state and accumulated Fourier fields so a long
@@ -191,3 +236,13 @@ decimals, and the sum-rule error was 5.0e-3. After the file renames, the same
 runs plus square and diamond particles gave numerically identical outputs; only
 the flux-file prefix and the header text changed. These are workflow checks, not a resolution-convergence study;
 `della.slurm` itself was not submitted.
+
+Voxel input (Della, Meep 1.31.0, stock libmeep; job files in `tests/slurm/`):
+all 660 files in the target data set load and match an independent loader voxel
+for voxel; the epsilon grid reproduces the voxel layout for odd and even sizes;
+a uniform slab and a 7-layer voxel stack match the analytic results to 0.005 at
+`-res 100` and 0.0012/0.0005 at `-res 200`; a voxelized `one_disk.txt` matches the
+disk path to 0.003, 0.0008, and 0.00013 in T at 20, 10, and 5 nm voxels. With no
+voxel input or new flag, every output of the existing examples is identical to
+the previous version. MPI rank count, x/y polarization of symmetric cells, and
+2x2 lateral tiling give identical spectra.
