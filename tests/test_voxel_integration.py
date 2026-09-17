@@ -17,6 +17,7 @@
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -278,9 +279,15 @@ def cmd_wrapper(work):
 	env.pop("VOXEL_SIZE", None)
 	rc, log = run(["bash", wrap, os.path.join(work, "no_size")], work, "no_size.out", env)
 	check(rc != 0 and "INPUT needs VOXEL_SIZE" in log, "INPUT without VOXEL_SIZE rejected (rc={0})".format(rc))
+	env = dict(os.environ, INPUT=npz, VOXEL_SIZE=str(VOXEL_SIZE))
+	env.pop("MAXT", None)
+	rc, log = run(["bash", wrap, os.path.join(work, "no_maxt")], work, "no_maxt.out", env)
+	check(rc != 0 and "INPUT needs MAXT" in log and "README" in log
+		  and not os.path.exists(os.path.join(work, "no_maxt")),
+		  "INPUT without MAXT rejected before any run (rc={0})".format(rc))
 
 	env = dict(os.environ, INPUT=os.path.relpath(npz, work), VOXEL_SIZE=str(VOXEL_SIZE),
-			   CROP="0:16,0:12,0:16", NORMAL_AXIS="0")
+			   CROP="0:16,0:12,0:16", NORMAL_AXIS="0", MAXT="200")
 	out = os.path.join(work, "run")
 	rc, log = run(["bash", wrap, out], work, "wrapper.out", env)
 	print(log)
@@ -297,8 +304,17 @@ def cmd_wrapper(work):
 	data, err = energy_error(os.path.join(out, "sample_trans-x.txt"))
 	print("wrapper: {0} frequencies, wavelength [{1:.5f}, {2:.5f}], max |T+|R|-1| = {3:.6e}".format(
 		data.shape[0], data[:, 0].min(), data[:, 0].max(), err))
-	check(data.shape[0] == 101 and abs(data[:, 0].min() - 0.38) < 1e-6 and abs(data[:, 0].max() - 0.78) < 1e-6,
-		  "wrapper spectrum: 101 frequencies over 380-780 nm")
+	check(data.shape[0] == 201 and abs(data[:, 0].min() - 0.38) < 1e-6 and abs(data[:, 0].max() - 0.78) < 1e-6,
+		  "wrapper spectrum: 201 frequencies over 380-780 nm")
+	with open(os.path.join(out, "sample.log")) as fh:
+		slog = fh.read()
+	# cell height h + ddet + dsrc + 2 dpml + 2 tpml * 0.78 = 0.16 + 0.2 + 0.4 + 0.6 + 2.34 (-tpml 1.5)
+	cells = re.findall(r"Computational cell is ([0-9.]+) x ([0-9.]+) x ([0-9.]+)", slog)
+	print("wrapper: Meep cell lines {0}".format(cells))
+	check(bool(cells) and abs(float(cells[-1][2]) - 3.7) < 0.011, "wrapper z cell height 3.7 (-tpml 1.5)")
+	check("WARNING: run reached the -maxt 200 ceiling" in slog
+		  or "stopped: dft converged" in open(os.path.join(out, "sample_trans-x.txt")).read(),
+		  "wrapper: header stopped line consistent with the -maxt 200 warning")
 	check(err <= 0.01, "wrapper energy balance {0:.3e} <= 0.01".format(err))
 
 

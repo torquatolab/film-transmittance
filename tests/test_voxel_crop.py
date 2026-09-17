@@ -2,7 +2,7 @@
 """Tests for voxel_crop.py (package P3). Plain script; exits nonzero on failure.
 
 Usage:
-	python tests/test_voxel_crop.py                       # synthetic + brute-force tests
+	python tests/test_voxel_crop.py                       # synthetic + brute-force tests (best_crop, select_crops)
 	python tests/test_voxel_crop.py --tiffs DIR --out J   # best_crop on every DIR/*.tif, write J
 """
 
@@ -20,7 +20,7 @@ from fractions import Fraction
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from voxel_crop import best_crop, seam_score  # noqa: E402
+from voxel_crop import best_crop, crop_string, seam_score, select_crops  # noqa: E402
 
 FAILS = []
 
@@ -171,6 +171,105 @@ def run_unit():
 			check(True, "invalid input raises ValueError")
 
 
+# ---- select_crops (D1) ----
+
+def brute_select(v, n_normal, f, k, sep):
+	"""Literal greedy definition: all crops in exact key order, accept if separated from every accepted one."""
+	lat = [ax for ax in range(3) if ax != n_normal]
+	opts = []
+	for a in lat:
+		L = v.shape[a]
+		m = math.ceil(f * L)
+		opts.append([(s, e) for s in range(L) for e in range(s + m, L + 1)])
+	allc = []
+	for (s1, e1), (s2, e2) in itertools.product(*opts):
+		sl = [None] * 3
+		sl[n_normal] = (0, v.shape[n_normal])
+		sl[lat[0]] = (s1, e1)
+		sl[lat[1]] = (s2, e2)
+		c = v[tuple(slice(s, e) for s, e in sl)]
+		allc.append(((exact_score(c, n_normal), -(e1 - s1) * (e2 - s2), s1, s2), [list(x) for x in sl]))
+	allc.sort(key=lambda t: t[0])
+	picked = []
+	for key, sl in allc:
+		if len(picked) == k:
+			break
+		if all(max(abs(key[2] - o[0]), abs(key[3] - o[1])) >= sep for o in (p[0] for p in picked)):
+			picked.append(((key[2], key[3]), sl))
+	return [sl for _, sl in picked]
+
+
+def offsets(c, n_normal):
+	return tuple(c["slices"][a][0] for a in range(3) if a != n_normal)
+
+
+def run_select():
+	# n = 1 equals best_crop (all normal axes, several fractions)
+	for seed in range(6):
+		r = np.random.default_rng(300 + seed)
+		n_normal = seed % 3
+		shape = [int(r.integers(6, 14)) for _ in range(3)]
+		shape[n_normal] = int(r.integers(2, 6))
+		v = smooth_nonperiodic(r, tuple(shape), corr=2.5) if seed % 2 else r.random(shape) < 0.4
+		f = [0.75, 0.5, 0.9][seed % 3]
+		one = select_crops(v, 1, n_normal, f)
+		check(len(one) == 1 and one[0] == best_crop(v, n_normal, f),
+			f"select_crops n=1 == best_crop (seed {seed}, normal {n_normal}, f {f}, shape {v.shape})")
+
+	# brute-force greedy definition, default and explicit separations
+	n_bf = 0
+	for seed in range(8):
+		r = np.random.default_rng(400 + seed)
+		n_normal = seed % 3
+		shape = [int(r.integers(7, 13)) for _ in range(3)]
+		shape[n_normal] = int(r.integers(2, 6))
+		v = smooth_nonperiodic(r, tuple(shape), corr=2.0) if seed % 2 else r.random(shape) < 0.5
+		f = [0.5, 0.6][seed % 2]
+		lat = [shape[a] for a in range(3) if a != n_normal]
+		for sep in (None, 1, 2, 3):
+			sep_eff = max(1, int(0.25 * min(lat))) if sep is None else sep
+			got = select_crops(v, 6, n_normal, f, sep)
+			want = brute_select(v, n_normal, f, 6, sep_eff)
+			check([c["slices"] for c in got] == want,
+				f"select_crops == brute greedy (seed {seed}, normal {n_normal}, f {f}, sep {sep} -> {sep_eff}, "
+				f"shape {v.shape}): {[c['slices'] for c in got]} vs {want}")
+			n_bf += 1
+			offs = [offsets(c, n_normal) for c in got]
+			ok = all(max(abs(a[0] - b[0]), abs(a[1] - b[1])) >= sep_eff
+				for i, a in enumerate(offs) for b in offs[i + 1:])
+			check(ok and len(set(offs)) == len(offs), f"  pairwise offset separation >= {sep_eff}: {offs}")
+			for c in got:
+				crop = v[tuple(slice(s, e) for s, e in c["slices"])]
+				if seam_score(crop, n_normal)["score"] != c["score"]:
+					check(False, f"  score of {c['slices']} == seam_score(crop)")
+	print(f"  select_crops brute-force comparisons: {n_bf}")
+
+	# determinism and ordering
+	v = smooth_nonperiodic(np.random.default_rng(21), (8, 30, 26), corr=3.0)
+	a = select_crops(v, 5)
+	b = select_crops(v.copy(), 5)
+	check(a == b, "select_crops deterministic repeat")
+	check(select_crops(v.astype(np.uint8) * 7, 5) == a, "select_crops uint8 input == bool input")
+	check(all(a[i]["score"] <= a[i + 1]["score"] for i in range(len(a) - 1)) or len(a) < 2,
+		"select_crops scores non-decreasing: {0}".format([round(c["score"], 6) for c in a]))
+	check(select_crops(v, 3) == a[:3], "select_crops n=3 is a prefix of n=5")
+	# 30x26 lateral, f = 0.75: offsets p0 in [0, 7], q0 in [0, 6]; default sep = 6
+	offs = [offsets(c, 0) for c in a]
+	print(f"  30x26 default sep: {len(a)} crops, offsets {offs}")
+	check(all(max(abs(x[0] - y[0]), abs(x[1] - y[1])) >= 6 for i, x in enumerate(offs) for y in offs[i + 1:]),
+		"30x26 default separation 6 holds")
+	# separation larger than any offset range: only one crop
+	check(len(select_crops(v, 5, min_offset_sep=100)) == 1, "min_offset_sep beyond the offset range gives 1 crop")
+	check(crop_string([[0, 8], [2, 25], [0, 20]]) == "0:8,2:25,0:20", "crop_string format")
+	for bad in (lambda: select_crops(v, 0), lambda: select_crops(v, 2, min_offset_sep=0),
+			lambda: select_crops(v, 2, 3), lambda: select_crops(v, 1.5)):
+		try:
+			bad()
+			check(False, "select_crops invalid input raises ValueError")
+		except ValueError:
+			check(True, "select_crops invalid input raises ValueError")
+
+
 # ---- TIFF runs (local reader: no dependency on voxel_io) ----
 
 def read_tiff(path):
@@ -228,5 +327,6 @@ if __name__ == "__main__":
 		run_tiffs(args.tiffs, args.out)
 	else:
 		run_unit()
+		run_select()
 	print(f"{len(FAILS)} failure(s)")
 	sys.exit(1 if FAILS else 0)

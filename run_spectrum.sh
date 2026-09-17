@@ -3,10 +3,12 @@ set -euo pipefail
 package_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 run_dir=${1:-"$PWD/results"}
 # Optional voxel example, enabled only by INPUT=<.npz/.tif/.tiff> VOXEL_SIZE=<micrometers>
-# (optional CROP=z0:z1,y0:y1,x0:x1 in stored axis order, NORMAL_AXIS). Resolved before cd.
+# MAXT=<ceiling> (optional CROP=z0:z1,y0:y1,x0:x1 in stored axis order, NORMAL_AXIS,
+# NFREQS). Resolved before cd.
 voxel_input=
 if [[ -n ${INPUT:-} ]]; then
     : "${VOXEL_SIZE:?INPUT needs VOXEL_SIZE (voxel edge length in micrometers)}"
+    : "${MAXT:?INPUT needs MAXT (simulation-time ceiling): use the value for the structure family from README.md, Voxel input}"
     voxel_input=$(cd "$(dirname "$INPUT")" && pwd)/$(basename "$INPUT")
     [[ -f $voxel_input ]] || { echo "INPUT $INPUT not found" >&2; exit 1; }
 fi
@@ -37,10 +39,10 @@ if [[ -n $voxel_input ]]; then
     # Solid n = 1.55 in vacuum, 380-780 nm; thickness and lateral cell come from the data.
     common=(-load "$voxel_input" -voxel_size "$VOXEL_SIZE"
             -eps "${EPS:-2.4025}" -eps_ref 1 -polarization x
-            -res "${RES:-100}" -ks 8.0553657784 16.5346981768 -nfreqs 101
-            -dsrc 0.4 -ddet 0.2 -dpml 0.3 -tpml 0.5
+            -res "${RES:-100}" -ks 8.0553657784 16.5346981768 -nfreqs "${NFREQS:-201}"
+            -dsrc 0.4 -ddet 0.2 -dpml 0.3 -tpml 1.5
             -ScattPower -comp Ex -dft_margin_px 4
-            -dft_nconsec 3 -dft_tol 1e-8 -maxt "${MAXT:-200}"
+            -dft_nconsec 3 -dft_tol 1e-8 -maxt "$MAXT"
             -tempname incident)
     if [[ -n ${CROP:-} ]]; then common+=(-crop "$CROP"); fi
     if [[ -n ${NORMAL_AXIS:-} ]]; then common+=(-normal_axis "$NORMAL_AXIS"); fi
