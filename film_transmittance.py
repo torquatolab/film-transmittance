@@ -246,6 +246,22 @@ def main(args):
 	pos_source = z_pos_source - z_center_offset
 	pos_detector2 = z_pos_detector2 - z_center_offset
 	film_z_center = 0.5*h - z_center_offset
+	if voxel_input:
+		# Amendment A3: move the film (not the source or the flux monitors) by at most half
+		# a pixel so its z faces lie midway between grid nodes.  Everything tied to the film
+		# position below (the block, the DFT analysis volume, the _z.npy coordinates) uses
+		# the shifted centre.  -ref computes the same shift, so reference and sample agree.
+		_px_per_voxel = args.res*args.voxel_size
+		if abs(_px_per_voxel - round(_px_per_voxel)) > 1e-9*max(1.0, abs(_px_per_voxel)):
+			print("WARNING: -res x -voxel_size = {0:.12g} is not an integer; interior voxel "
+				"faces will not align with the Meep grid".format(_px_per_voxel), flush=True)
+		_unaligned_z_center = film_z_center
+		film_z_center = voxel_geometry.aligned_z_center(film_z_center, h, args.res, cell_height)
+		print("voxel film z centre: {0:.12g} -> {1:.12g} (shift {2:+.3e} = {3:+.4f} px) so the "
+			"film z faces lie midway between grid nodes".format(_unaligned_z_center, film_z_center,
+				film_z_center - _unaligned_z_center, (film_z_center - _unaligned_z_center)*args.res))
+		geometry_meta.update(film_z_center=float(film_z_center),
+							 film_z_shift=float(film_z_center - _unaligned_z_center))
 
 	#generate header and geometry -----#
 	header = GenerateHeader (args)

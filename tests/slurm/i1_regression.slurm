@@ -11,7 +11,9 @@
 # voxel module imported.  Required env: OUT (a directory whose parent holds packing.txt,
 # as harness.sh loads ../../packing.txt from OUT/D), HARNESS (a COPY of
 # film-audit/harness.sh), GOLDEN (film-audit/out_new), GOLDEN_RC (the harness stdout that
-# produced GOLDEN), TRIPWIRE (directory of raising voxel_io/voxel_geometry/voxel_crop).
+# produced GOLDEN), TRIPWIRE (directory holding a sitecustomize.py that drops an
+# IMPORTED_<module>.<pid> marker whenever voxel_io/voxel_geometry/voxel_crop is looked up;
+# shadowing modules no longer work because the real ones sit next to the script).
 set -uo pipefail
 export PATH=/scratch/gpfs/TORQUATO/sd2402/conda_envs/film-meep/bin:$PATH
 CODE=${CODE:-$SLURM_SUBMIT_DIR}
@@ -21,5 +23,9 @@ bash "$HARNESS" "$CODE" "$OUT" | tee "$OUT.rc"
 diff <(grep ' rc=\|^DONE' "$GOLDEN_RC") "$OUT.rc" && echo "PASS: harness return codes identical to golden" || { echo "FAIL: harness return codes differ"; fail=1; }
 python "$CODE/tests/test_voxel_integration.py" compare "$OUT" "$GOLDEN" | grep -v '^PASS' ; rc1=${PIPESTATUS[0]}
 python "$CODE/tests/test_voxel_integration.py" tripwire "$TRIPWIRE"; rc2=$?
+# positive control: the tripwire does fire on a voxel import (marker removed afterwards)
+( cd "$CODE" && python -c "import voxel_crop" )
+ls "$TRIPWIRE"/IMPORTED_voxel_crop.* >/dev/null 2>&1 && echo "PASS: tripwire positive control fired" || { echo "FAIL: tripwire positive control did not fire"; fail=1; }
+rm -f "$TRIPWIRE"/IMPORTED_*
 echo "compare rc=$rc1 tripwire rc=$rc2"
 exit $(( ${fail:-0} || rc1 || rc2 ))
