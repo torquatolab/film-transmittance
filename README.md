@@ -144,9 +144,24 @@ The voxel example in `run_spectrum.sh` uses the production settings: `-res 100`,
 -dft_nconsec 3`. `MAXT` has no default for voxel input: these structures
 generally do not meet the DFT stopping criterion and stop at the ceiling, so the
 ceiling is a fixed value per structure family, taken from convergence runs.
-The family values are not determined yet (convergence runs pending); until they
-are, choose `MAXT` from your own `-snapshot_dt` runs (below). The script's own
-argparse defaults, and the non-voxel example, are unchanged.
+The script's own argparse defaults, and the non-voxel example, are unchanged.
+
+| Family (voxel size 10 nm, n = 1.55, res 100) | `MAXT` | Basis |
+|---|---|---|
+| SHU packings (`data/shu`, 256³) | 200 | settled by t = 150 (dense φ₂ = 0.45) and 50 (dilute φ₂ = 0.05) |
+| Disordered benchmarks (GRF; DHU/DRM untested) | 200 | GRF settled by t = 125 |
+| Periodic benchmarks (TPMS, channels) | 1125 | SquareChannel settled by t = 900; SchoenG never settles (see below) |
+| TIFF stacks, crop-averaged spectrum | 750 | 4-crop DarkGreen average settled by t = 600; single crops do not |
+
+"Settled" means that from that time to the end of a much longer run, every
+20-band average of T and R changed by at most 0.01, the median per-wavelength
+change of T was at most 0.002, and the band-averaged T + |R| − 1 was within
+0.01; `MAXT` is that time rounded up to a multiple of 50 and multiplied by 1.25.
+Individual wavelengths near diffraction thresholds of the lateral period
+(λ = L/√(m² + n²)) can still move by 0.01–0.03 (up to 0.07 for SquareChannel near
+689 nm, a slowly beating guided resonance). These values come from two SHU
+files, three benchmarks, and one TIFF stack; check a new family with
+`-snapshot_dt` before a campaign.
 The voxel spectrum header records how the run ended: `# stopped: maxt ceiling`
 or `# stopped: dft converged`.
 
@@ -194,7 +209,7 @@ frequency bands, each with the mean and spread over crops of the band-averaged
 T and R, for single-number or colour use. The crops overlap, so their spread
 indicates the sensitivity to the crop choice, not an independent error bar.
 
-**Known limitations (validation of 2026-09-17).**
+**Known limitations (validation of 2026-09-17 and 2026-09-18).**
 For cells whose lateral period exceeds the wavelength, the former z padding
 (`-tpml 0.5`) was not adequate: a periodic unit cell gave an unphysical
 T = -0.052 near a diffraction cutoff, and a TIFF crop grew without bound after
@@ -205,6 +220,16 @@ non-periodic stack depend on the lateral boundary treatment by about 0.02 in T
 on average (up to about 0.2 at sharp resonances), which is why TIFF spectra are
 averaged over crops; 101 frequencies under-resolved their narrow features,
 hence 201.
+
+Longer is not always better. With `-tpml 1.5`, SchoenG (gyroid, 0.64 µm unit
+cell) shows an error that grows exponentially after t ≈ 1150 just above the
+640 nm (1,0) diffraction threshold: T at 641.6 nm is 0.95 at t = 1125, 0.68 at
+1300, and −2.16 at 2000, and band-averaged T never settles (window spread about
+0.02–0.03 over t = 600–1100). GRF shows a weak broadband version from
+t ≈ 600, and a DarkGreen crop one at 592.8 nm. The cause is inferred to be PML
+reflection of grazing diffracted orders; it is not fixed. Use the `MAXT`
+values above rather than longer runs, and treat SchoenG spectra near 640–740 nm
+as uncertain by about 0.03.
 
 ## Checkpoints: continue an interrupted calculation
 
@@ -304,3 +329,13 @@ identical tables. `select_crops` and `average_spectra.py` match independent
 reference implementations on synthetic data. On `DarkGreen.tif` (lateral 75 x 145
 voxels) the default offset separation (18 voxels) admits 4 crops;
 `MIN_OFFSET_SEP=17` gives 5.
+
+Convergence runs for `MAXT` (Della, 32–96 ranks, `-snapshot_dt 25`, all other
+settings as the voxel example): SHU φ₂ = 0.45 and 0.05 to t = 1000, GRF to 1000,
+SquareChannel and SchoenG to 2000 (one full 256³ cell of about 4×10⁷ grid cells
+each), and four DarkGreen crops to 2000. None met the DFT stopping criterion. At
+the recommended `MAXT` one 256³ structure costs about 55–76 core-hours (SHU, GRF;
+1.7–2.4 h on 32 cores, about 40 GB) or about 370–450 core-hours (periodic
+benchmarks); 32, 64, and 96 ranks give identical spectra, and 96 ranks cut wall
+time about 2.8× at similar core-hours. Snapshots showed which settled times
+the table above uses.
