@@ -149,13 +149,13 @@ def _exact_ratio(S, Bsum, L, plane):
 	return Fraction(S, plane) * 10 ** 12
 
 
-def best_crop(voxels: np.ndarray, normal_axis: int = 0, min_fraction: float = 0.75) -> dict:
-	"""Exact minimum-seam-score lateral crop (see module docstring).
+def _search_space(v, normal_axis, min_fraction):
+	"""Steps 1-2 of the module docstring for bool ``v``: the per-crop look-up tables.
 
-	Returns ``{"slices": [[s0,e0],[s1,e1],[s2,e2]], "score", "per_axis",
-	"kept_fraction", "full_score"}`` in stored axis order (half-open slices).
+	Returns a dict with the lateral axes ``p``, ``q``, the transposed shape ``N, A, B``,
+	the candidate ranges ``a0s, a1s, b0s, b1s`` (lengths ``LA, LB``), ``row(ia)`` and
+	``key(c)`` (exact ranking of a candidate from ``row``).
 	"""
-	v = _check(voxels, normal_axis)
 	if not (0 < min_fraction <= 1):
 		raise ValueError(f"min_fraction must be in (0, 1], got {min_fraction}")
 	p, q = [ax for ax in range(3) if ax != normal_axis]
@@ -193,21 +193,6 @@ def best_crop(voxels: np.ndarray, normal_axis: int = 0, min_fraction: float = 0.
 				S2 / (N * la) / _EPS_BASELINE)
 		return 0.5 * (r1 + r2), S1, B1, S2, B2
 
-	best = np.inf
-	for ia in range(len(a0s)):
-		best = min(best, float(row(ia)[0].min()))
-
-	thresh = best * (1 + _REL_TIE) if best > 0 else 0.0
-	cands = []
-	for ia in range(len(a0s)):
-		sc, S1, B1, S2, B2 = row(ia)
-		hits = np.nonzero(sc <= thresh)[0]
-		if best == 0 and len(hits) > 1:
-			# every hit is an exact 0 score: keep only this row's tie-break winner
-			hits = hits[np.lexsort((b0s[hits], -LB[hits]))[:1]]
-		for ib in hits:
-			cands.append((ia, int(ib), int(S1[ib]), int(B1[ib]), int(S2[ib]), int(B2[ib])))
-
 	def key(c):
 		ia, ib, S1, B1, S2, B2 = c
 		la = int(LA[ia])
@@ -215,18 +200,152 @@ def best_crop(voxels: np.ndarray, normal_axis: int = 0, min_fraction: float = 0.
 		exact = _exact_ratio(S1, B1, la, N * lb) + _exact_ratio(S2, B2, lb, N * la)
 		return (exact, -la * lb, int(a0s[ia]), int(b0s[ib]))
 
-	ia, ib = min(cands, key=key)[:2]
+	return {"p": p, "q": q, "N": N, "A": A, "B": B, "a0s": a0s, "a1s": a1s,
+		"b0s": b0s, "b1s": b1s, "LA": LA, "LB": LB, "row": row, "key": key}
+
+
+def _best_index(sp, taken=(), sep=None):
+	"""Steps 3-4: indices ``(ia, ib)`` of the exact best crop, or None if none is allowed.
+
+	With ``taken`` (offsets ``(p0, q0)`` already chosen), only crops whose offset differs
+	from every taken one by at least ``sep`` on at least one lateral axis are allowed.
+	"""
+	row, a0s, b0s, LB = sp["row"], sp["a0s"], sp["b0s"], sp["LB"]
+
+	def scores(ia):
+		out = row(ia)
+		if not taken:
+			return out
+		allowed = np.ones(len(b0s), dtype=bool)
+		for pa, pb in taken:
+			allowed &= (abs(int(a0s[ia]) - pa) >= sep) | (np.abs(b0s - pb) >= sep)
+		return (np.where(allowed, out[0], np.inf),) + out[1:]
+
+	best = np.inf
+	for ia in range(len(a0s)):
+		best = min(best, float(scores(ia)[0].min()))
+	if best == np.inf:
+		return None
+
+	thresh = best * (1 + _REL_TIE) if best > 0 else 0.0
+	cands = []
+	for ia in range(len(a0s)):
+		sc, S1, B1, S2, B2 = scores(ia)
+		hits = np.nonzero(sc <= thresh)[0]
+		if best == 0 and len(hits) > 1:
+			# every hit is an exact 0 score: keep only this row's tie-break winner
+			hits = hits[np.lexsort((b0s[hits], -LB[hits]))[:1]]
+		for ib in hits:
+			cands.append((ia, int(ib), int(S1[ib]), int(B1[ib]), int(S2[ib]), int(B2[ib])))
+	return min(cands, key=sp["key"])[:2]
+
+
+def _crop_result(v, sp, ia, ib, normal_axis, full_score):
 	slices = [[0, 0], [0, 0], [0, 0]]
-	slices[normal_axis] = [0, N]
-	slices[p] = [int(a0s[ia]), int(a1s[ia])]
-	slices[q] = [int(b0s[ib]), int(b1s[ib])]
+	slices[normal_axis] = [0, sp["N"]]
+	slices[sp["p"]] = [int(sp["a0s"][ia]), int(sp["a1s"][ia])]
+	slices[sp["q"]] = [int(sp["b0s"][ib]), int(sp["b1s"][ib])]
 	crop = v[tuple(slice(s, e) for s, e in slices)]
 	res = seam_score(crop, normal_axis)
-	full = seam_score(v, normal_axis)
 	return {
 		"slices": slices,
 		"score": res["score"],
 		"per_axis": res["per_axis"],
-		"kept_fraction": float(LA[ia] * LB[ib]) / float(A * B),
-		"full_score": full["score"],
+		"kept_fraction": float(sp["LA"][ia] * sp["LB"][ib]) / float(sp["A"] * sp["B"]),
+		"full_score": full_score,
 	}
+
+
+def best_crop(voxels: np.ndarray, normal_axis: int = 0, min_fraction: float = 0.75) -> dict:
+	"""Exact minimum-seam-score lateral crop (see module docstring).
+
+	Returns ``{"slices": [[s0,e0],[s1,e1],[s2,e2]], "score", "per_axis",
+	"kept_fraction", "full_score"}`` in stored axis order (half-open slices).
+	"""
+	v = _check(voxels, normal_axis)
+	sp = _search_space(v, normal_axis, min_fraction)
+	ia, ib = _best_index(sp)
+	return _crop_result(v, sp, ia, ib, normal_axis, seam_score(v, normal_axis)["score"])
+
+
+def select_crops(voxels: np.ndarray, n: int, normal_axis: int = 0, min_fraction: float = 0.75,
+		min_offset_sep=None) -> list:
+	"""Up to ``n`` lateral crops with low seam scores and well-separated offsets.
+
+	Greedy and deterministic: crop ``k`` is the exact best crop (same ranking and
+	tie-breaks as ``best_crop``) among those whose lateral offset ``(p0, q0)`` differs
+	from the offset of every earlier crop by at least ``min_offset_sep`` voxels on at
+	least one lateral axis. The first crop is therefore ``best_crop``'s. Crops may
+	overlap (they usually do: each keeps at least ``min_fraction`` of both lateral axes),
+	so their spectra are not independent samples. Fewer than ``n`` crops are returned
+	when no further offset satisfies the separation.
+
+	``min_offset_sep`` defaults to ``max(1, floor(0.25 * min(n_p, n_q)))`` (25% of the
+	smaller lateral extent, in whole voxels). Returns a list of ``best_crop`` dicts.
+	"""
+	v = _check(voxels, normal_axis)
+	if int(n) != n or n < 1:
+		raise ValueError(f"n must be a positive integer, got {n}")
+	sp = _search_space(v, normal_axis, min_fraction)
+	if min_offset_sep is None:
+		min_offset_sep = max(1, int(0.25 * min(sp["A"], sp["B"])))
+	if not min_offset_sep > 0:
+		raise ValueError(f"min_offset_sep must be > 0, got {min_offset_sep}")
+	full_score = seam_score(v, normal_axis)["score"]
+	crops, taken = [], []
+	while len(crops) < n:
+		found = _best_index(sp, taken, min_offset_sep)
+		if found is None:
+			break
+		ia, ib = found
+		taken.append((int(sp["a0s"][ia]), int(sp["b0s"][ib])))
+		crops.append(_crop_result(v, sp, ia, ib, normal_axis, full_score))
+	return crops
+
+
+def crop_string(slices) -> str:
+	"""``-crop`` argument (``z0:z1,y0:y1,x0:x1``, stored axis order) for crop slices."""
+	return ",".join(f"{s}:{e}" for s, e in slices)
+
+
+def main(argv=None):
+	import argparse
+	import json
+	import os
+	import sys
+
+	ap = argparse.ArgumentParser(description="Print one -crop string per line for the "
+		"select_crops crops of a voxel stack (normal axis 0); scores go to stderr.")
+	ap.add_argument("stack", help=".npz (array g) or .tif/.tiff voxel file")
+	ap.add_argument("--n", type=int, default=1, help="number of crops (default: 1)")
+	ap.add_argument("--min_fraction", type=float, default=0.75,
+		help="minimum kept fraction of each lateral axis (default: 0.75)")
+	ap.add_argument("--min_offset_sep", type=float, default=None,
+		help="minimum offset difference in voxels (default: 25%% of the smaller lateral extent)")
+	ap.add_argument("--json", default=None, help="also write the crop dicts to this JSON file")
+	args = ap.parse_args(argv)
+	sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+	import voxel_io
+
+	voxels, provenance = voxel_io.load_voxels(args.stack)
+	crops = select_crops(voxels, args.n, min_fraction=args.min_fraction,
+		min_offset_sep=args.min_offset_sep)
+	for i, c in enumerate(crops):
+		print(crop_string(c["slices"]))
+		sys.stderr.write(f"crop {i}: {crop_string(c['slices'])} score {c['score']:.6f} "
+			f"kept_fraction {c['kept_fraction']:.4f} (full-stack score {c['full_score']:.6f})\n")
+	if len(crops) < args.n:
+		sys.stderr.write(f"only {len(crops)} of {args.n} crops satisfy the offset separation\n")
+	if args.json:
+		with open(args.json, "w") as fh:
+			json.dump({"stack": provenance["path"], "sha256": provenance["sha256"],
+				"shape": provenance["shape"], "min_fraction": args.min_fraction,
+				"min_offset_sep": args.min_offset_sep,
+				"crops": [dict(c, crop=crop_string(c["slices"]),
+					per_axis={str(k): d for k, d in c["per_axis"].items()}) for c in crops]},
+				fh, indent=1)
+	return 0
+
+
+if __name__ == "__main__":
+	raise SystemExit(main())

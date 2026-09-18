@@ -17,7 +17,9 @@ film; see "Voxel input" below.
 | `della.slurm` | Princeton Della batch template for `run_spectrum.sh` |
 | `voxel_io.py` | Voxel input: reads `.npz`/`.tif` arrays, checks JSON sidecar fractions |
 | `voxel_geometry.py` | Voxel input: axis orientation, crop, MaterialGrid film, grid alignment |
-| `voxel_crop.py` | Chooses the lateral crop of a non-periodic stack with the best-matching faces |
+| `voxel_crop.py` | Chooses lateral crops of a non-periodic stack with well-matching faces |
+| `run_crops.sh` | Voxel input: runs `run_spectrum.sh` on several crops of one stack and averages them |
+| `average_spectra.py` | Mean and crop-to-crop spread of several spectrum tables, plus band averages |
 | `tests/` | Validation scripts and Della job files used to check the voxel input (see `tests/README.md`) |
 | `examples/one_disk.txt` | Example pattern: one disk per square unit cell |
 | `patches/` | Optional Meep patch and installer needed for checkpoint/restart |
@@ -114,7 +116,7 @@ lower it for silver: the script uses Courant factor 0.5 for these materials,
 and the Ag example diverged (`simulation fields are NaN or Inf`) at `RES` 40,
 50, and 60, while 70 and 80 ran. At `RES=40`, Courant 0.4 was stable. Refine
 resolution, PML/separations, and DFT tolerance until the spectrum is stable.
-`MAXT=200` is a **simulation-time ceiling**, not seconds of wall time; reaching
+`MAXT=200` (the non-voxel example's default) is a **simulation-time ceiling**, not seconds of wall time; reaching
 it produces output without proving convergence. The log then contains a
 `WARNING: run reached the -maxt ... ceiling` line; increase the ceiling if so.
 
@@ -132,9 +134,44 @@ half-open) simulates a sub-block. A JSON sidecar next to an `.npz` is checked:
 the solid fraction must match `phi1_realized`, or else `phi2_realized`.
 
 ```bash
-INPUT=path/structure.npz VOXEL_SIZE=0.01 bash run_spectrum.sh results-voxel
-INPUT=stack.tif VOXEL_SIZE=0.01 CROP=0:258,0:57,16:134 bash run_spectrum.sh results-tif
+INPUT=path/structure.npz VOXEL_SIZE=0.01 MAXT=<family value> bash run_spectrum.sh results-voxel
+INPUT=stack.tif VOXEL_SIZE=0.01 MAXT=<family value> CROP=0:258,0:57,16:134 bash run_spectrum.sh results-tif
 ```
+
+The voxel example in `run_spectrum.sh` uses the production settings: `-res 100`,
+`-tpml 1.5` (PML 1.17 micrometers thick), 201 frequencies over 380–780 nm
+(`NFREQS` overrides), `-dsrc 0.4 -ddet 0.2 -dpml 0.3`, and `-dft_tol 1e-8
+-dft_nconsec 3`. `MAXT` has no default for voxel input: these structures
+generally do not meet the DFT stopping criterion and stop at the ceiling, so the
+ceiling is a fixed value per structure family, taken from convergence runs.
+The script's own argparse defaults, and the non-voxel example, are unchanged.
+
+| Family (voxel size 10 nm, n = 1.55, res 100) | `MAXT` | Basis |
+|---|---|---|
+| SHU packings (`data/shu`, 256³) | 200 | settled by t = 150 (dense φ₂ = 0.45) and 50 (dilute φ₂ = 0.05) |
+| Disordered benchmarks (GRF; DHU/DRM untested) | 200 | GRF settled by t = 125 |
+| Periodic benchmarks (TPMS, channels) | 1125 | SquareChannel settled by t = 900; SchoenG never settles (see below) |
+| TIFF stacks, crop-averaged spectrum | 750 | 4-crop DarkGreen average settled by t = 600; single crops do not |
+
+"Settled" means that from that time to the end of a much longer run, every
+20-band average of T and R changed by at most 0.01, the median per-wavelength
+change of T was at most 0.002, and the band-averaged T + |R| − 1 was within
+0.01; `MAXT` is that time rounded up to a multiple of 50 and multiplied by 1.25.
+Individual wavelengths near diffraction thresholds of the lateral period
+(λ = L/√(m² + n²)) can still move by 0.01–0.03 (up to 0.07 for SquareChannel near
+689 nm, a slowly beating guided resonance). These values come from two SHU
+files, three benchmarks, and one TIFF stack; check a new family with
+`-snapshot_dt` before a campaign.
+The voxel spectrum header records how the run ended: `# stopped: maxt ceiling`
+or `# stopped: dft converged`.
+
+`-snapshot_dt DT` (sample runs with `-ScattPower`; ignored for `-ref`; not with
+`-JouleHeating`) writes the spectrum table every DT simulation time units to
+`<saveas>_snapshots/trans-<pol>-t<time>.txt`, from the flux data accumulated so
+far, with the same columns, format, and computation as the final table (the
+snapshot header has no `stopped:` line). The final table is unchanged by the
+option. Comparing snapshots shows when T and R stop changing, which is how a
+family's `MAXT` is chosen.
 
 The array is placed with `mp.MaterialGrid`, one sample per voxel. Use
 `-res` equal to an integer multiple of `1/voxel_size`: the lateral block centre
@@ -143,21 +180,56 @@ midway between grid nodes (the log prints the shift). Keep
 `-interface_averaging` off; it was less accurate in every test. The x/y
 boundaries are periodic, so the array is treated as one period of an infinite
 film. For stacks that are not periodic, `voxel_crop.best_crop()` finds the
-lateral crop whose opposite faces match best. `-no_fields` skips the volume
+lateral crop whose opposite faces match best, and `voxel_crop.select_crops()`
+returns several low-seam crops whose lateral offsets differ by at least 25% of
+the smaller lateral extent on one axis (they may overlap). `-no_fields` skips the volume
 field arrays (spectra only); `-field_wavelengths` saves them only at listed
 wavelengths. Reference and sample runs must use the same file, crop, voxel
 size, and normal axis; the sample run refuses a reference that differs.
 
-**Known limitations (validation of 2026-09-17; the defaults are being revised).**
-For cells whose lateral period exceeds the wavelength, the default z padding
-(`-ddet 0.2 -dpml 0.3 -tpml 0.5`) is not adequate: a periodic unit cell gave an
-unphysical T = -0.052 near a diffraction cutoff, and a TIFF crop grew without
-bound after t ~ 250. `-tpml 1.5` removed both. Runs of these structures do not
-meet the DFT stopping criterion and stop at `-maxt`, so the ceiling must be
-chosen and checked per structure family. Spectra of cropped non-periodic
-stacks depend on the lateral boundary treatment by about 0.02 in T on average
-(up to about 0.2 at sharp resonances), and 101 frequencies under-resolve their
-narrow features.
+For a TIFF stack, report the spectrum averaged over several crops rather than
+one crop:
+
+```bash
+VOXEL_SIZE=0.01 MAXT=<family value> BANDS=20 bash run_crops.sh stack.tif 5 results-crops
+DRY=1 VOXEL_SIZE=0.01 MAXT=<family value> bash run_crops.sh stack.tif 5 results-crops  # print only
+```
+
+`run_crops.sh STACK N OUTDIR` selects up to N crops with
+`python voxel_crop.py STACK --n N` (one `-crop` string per line; `--json` saves
+the scores; `MIN_OFFSET_SEP` / `--min_offset_sep` lowers the required offset
+difference when a small stack yields fewer than N crops), runs `run_spectrum.sh` for each into `OUTDIR/crop_<i>` one after
+another with the same environment, then runs
+`python average_spectra.py OUTDIR/mean_trans-x.txt OUTDIR/crop_*/sample_trans-x.txt`.
+The mean table has, per wavelength, mean and standard deviation over crops of T
+and of the signed reflectance, the mean of T + |R| − 1, and the number of
+crops; its header lists the inputs and flags those that stopped at the `MAXT`
+ceiling. `BANDS=K` (`--bands K`) adds `mean_trans-x_bands.txt`: K contiguous
+frequency bands, each with the mean and spread over crops of the band-averaged
+T and R, for single-number or colour use. The crops overlap, so their spread
+indicates the sensitivity to the crop choice, not an independent error bar.
+
+**Known limitations (validation of 2026-09-17 and 2026-09-18).**
+For cells whose lateral period exceeds the wavelength, the former z padding
+(`-tpml 0.5`) was not adequate: a periodic unit cell gave an unphysical
+T = -0.052 near a diffraction cutoff, and a TIFF crop grew without bound after
+t ~ 250. `-tpml 1.5`, now the voxel default, removed both. Runs of these
+structures do not meet the DFT stopping criterion and stop at `MAXT`, so the
+ceiling must be chosen and checked per structure family. Spectra of one cropped
+non-periodic stack depend on the lateral boundary treatment by about 0.02 in T
+on average (up to about 0.2 at sharp resonances), which is why TIFF spectra are
+averaged over crops; 101 frequencies under-resolved their narrow features,
+hence 201.
+
+Longer is not always better. With `-tpml 1.5`, SchoenG (gyroid, 0.64 µm unit
+cell) shows an error that grows exponentially after t ≈ 1150 just above the
+640 nm (1,0) diffraction threshold: T at 641.6 nm is 0.95 at t = 1125, 0.68 at
+1300, and −2.16 at 2000, and band-averaged T never settles (window spread about
+0.02–0.03 over t = 600–1100). GRF shows a weak broadband version from
+t ≈ 600, and a DarkGreen crop one at 592.8 nm. The cause is inferred to be PML
+reflection of grazing diffracted orders; it is not fixed. Use the `MAXT`
+values above rather than longer runs, and treat SchoenG spectra near 640–740 nm
+as uncertain by about 0.03.
 
 ## Checkpoints: continue an interrupted calculation
 
@@ -246,3 +318,24 @@ disk path to 0.003, 0.0008, and 0.00013 in T at 20, 10, and 5 nm voxels. With no
 voxel input or new flag, every output of the existing examples is identical to
 the previous version. MPI rank count, x/y polarization of symmetric cells, and
 2x2 lateral tiling give identical spectra.
+
+Production defaults, snapshots and crop averaging (Della, `tests/slurm/d1_*.slurm`):
+with no voxel input and no `-snapshot_dt`, every output of the existing examples is
+again identical to the previous version. On a 20x16x16 voxel film at 1, 2 and 4
+MPI ranks, the final table with `-snapshot_dt` is byte-identical to the table
+without it, snapshot files appear at every multiple of DT up to the stop time, and
+the snapshot at the stop time equals the final table; the three rank counts give
+identical tables. `select_crops` and `average_spectra.py` match independent
+reference implementations on synthetic data. On `DarkGreen.tif` (lateral 75 x 145
+voxels) the default offset separation (18 voxels) admits 4 crops;
+`MIN_OFFSET_SEP=17` gives 5.
+
+Convergence runs for `MAXT` (Della, 32–96 ranks, `-snapshot_dt 25`, all other
+settings as the voxel example): SHU φ₂ = 0.45 and 0.05 to t = 1000, GRF to 1000,
+SquareChannel and SchoenG to 2000 (one full 256³ cell of about 4×10⁷ grid cells
+each), and four DarkGreen crops to 2000. None met the DFT stopping criterion. At
+the recommended `MAXT` one 256³ structure costs about 55–76 core-hours (SHU, GRF;
+1.7–2.4 h on 32 cores, about 40 GB) or about 370–450 core-hours (periodic
+benchmarks); 32, 64, and 96 ranks give identical spectra, and 96 ranks cut wall
+time about 2.8× at similar core-hours. Snapshots showed which settled times
+the table above uses.

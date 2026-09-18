@@ -74,6 +74,34 @@ def _abort_if_write_failed(ok, what):
 		raise SystemExit("aborting: {0} failed".format(what))
 
 
+def _flux_table(trans, refl, inc_flux):
+	"""Wavelength, T, R and incident-flux columns from the flux monitors' current DFT data.
+
+	Collective (mp.get_fluxes sums over all ranks): every rank must call it.  The final
+	spectrum and every -snapshot_dt snapshot come from this one function.
+	"""
+	trans_flux = mp.get_fluxes(trans)
+	refl_flux = mp.get_fluxes(refl)
+	flux_freqs = mp.get_flux_freqs(trans)
+
+	wl = []
+	Ts = []
+	Inc = []
+	Re = []
+	for i in range(len(flux_freqs)):
+		wl = np.append(wl, 1/flux_freqs[i])
+		Ts = np.append(Ts, trans_flux[i]/inc_flux[i])
+		Re = np.append(Re, refl_flux[i]/inc_flux[i])
+		Inc = np.append(Inc, inc_flux[i])
+	return wl, Ts, Re, Inc
+
+
+def _save_table(filename, result, header):
+	"""Master-only write of a spectrum table (same format for final table and snapshots)."""
+	return _master_save(np.savetxt, filename, result, fmt='%1.6e',
+						delimiter='\t', header=header)
+
+
 def _write_json(path, data):
 	with open(path, "w") as fh:
 		json.dump(data, fh, indent=1)
@@ -750,8 +778,35 @@ def main(args):
 				print("checkpointing to {0} every {1:g} h".format(
 					ckpt_dir, args.checkpoint_interval), flush=True)
 
+			if args.snapshot_dt > 0:
+				if args.ref:
+					print("-snapshot_dt: no snapshots for a -ref run\n")
+				else:
+					snapshot_dir = "{0}_snapshots".format(args.saveas)
+					snapshot_inc_flux = np.load("{0}_inc_flux.npy".format(temp_name))
+					_abort_if_write_failed(_master_save(os.makedirs, snapshot_dir, exist_ok=True),
+						"snapshot directory creation")
+
+					def _snapshot(sim_):
+						"""Write the spectrum table as it stands at this simulation time.
+
+						Every rank gets here (mp.at_every decides from the simulation time,
+						identical on all ranks), which _flux_table's collective flux reads
+						and _abort_if_write_failed require; only master writes.
+						"""
+						wl_, T_, R_, Inc_ = _flux_table(trans, refl, snapshot_inc_flux)
+						name_ = os.path.join(snapshot_dir, "trans-{0}-t{1:.2f}.txt".format(
+							args.polarization, sim_.meep_time()))
+						_abort_if_write_failed(_save_table(name_,
+							np.column_stack((wl_, T_, R_, Inc_)), header), "snapshot write")
+
+					run_args.insert(0, mp.at_every(args.snapshot_dt, _snapshot))
+					print("snapshots every {0:g} time units to {1}\n".format(
+						args.snapshot_dt, snapshot_dir), flush=True)
+
 			sim.run(*run_args[:-1], until_after_sources=run_args[-1])
-			if args.maxt > 0 and sim.round_time() > args.maxt:
+			stopped_at_maxt = args.maxt > 0 and sim.round_time() > args.maxt
+			if stopped_at_maxt:
 				print("WARNING: run reached the -maxt {0:g} ceiling (t = {1:g}); the DFT "
 					"convergence criterion was not confirmed\n".format(args.maxt, sim.round_time()),
 					flush=True)
@@ -876,19 +931,7 @@ def main(args):
 				# load incident fluxes
 					print("computing transmittance\n")
 					inc_flux = np.load("{0}_inc_flux.npy".format(temp_name))
-					trans_flux = mp.get_fluxes(trans)
-					refl_flux = mp.get_fluxes(refl)
-					flux_freqs = mp.get_flux_freqs(trans)
-
-					wl = []
-					Ts = []
-					Inc = []
-					Re = []
-					for i in range(len(flux_freqs)):
-						wl = np.append(wl, 1/flux_freqs[i])
-						Ts = np.append(Ts, trans_flux[i]/inc_flux[i])
-						Re = np.append(Re, refl_flux[i]/inc_flux[i])
-						Inc = np.append(Inc, inc_flux[i])						
+					wl, Ts, Re, Inc = _flux_table(trans, refl, inc_flux)
 
 					sum_rule_error = None
 					if args.JouleHeating:
@@ -905,9 +948,13 @@ def main(args):
 					print("saving transmittance\n")
 					filename = '{0}_trans-{1}.txt'.format(args.saveas, args.polarization)
 					print("at "+filename+"\n")
-					_abort_if_write_failed(
-						_master_save(np.savetxt, filename, result, fmt='%1.6e',
-									 delimiter='\t', header=header),
+					table_header = header
+					if voxel_input:
+						# How the run ended, as a header line above the column names.
+						_head, _columns = header.rsplit('\n', 1)
+						table_header = "{0}\nstopped: {1}\n{2}".format(_head,
+							"maxt ceiling" if stopped_at_maxt else "dft converged", _columns)
+					_abort_if_write_failed(_save_table(filename, result, table_header),
 						"transmittance write")
 					# Checked AFTER the write, deliberately.  Refusing before it would
 					# destroy a 30 h result to protect against quoting it -- and the T, A
@@ -995,6 +1042,13 @@ if __name__ == '__main__':
 			 'are named __ka-{round(2*pi/lambda, 4)}')
 	# --- end field output (P4) ---
 
+	# --- spectrum snapshots (D1) ---
+	parser.add_argument('-snapshot_dt', type=float, default=0.0,
+		help='sample runs with -ScattPower: every DT simulation time units write '
+			 '<saveas>_snapshots/trans-<pol>-t<time>.txt, the T/R table of the flux data '
+			 'accumulated so far (0 = off; no-op for -ref; not with -JouleHeating)')
+	# --- end spectrum snapshots (D1) ---
+
 	# --- voxel input (I1) ---
 	# A -load ending in .npz/.tif/.tiff is a 3D voxel array (True = solid = -eps, False =
 	# void = -eps_ref) instead of a 2D pattern; Lx, Ly and the film thickness come from it.
@@ -1059,6 +1113,13 @@ if __name__ == '__main__':
 			raise SystemExit("-field_wavelengths {0} give duplicate file names ka-{1}".format(
 				args.field_wavelengths, _knames))
 	# --- end field output (P4) ---
+	# --- spectrum snapshots (D1) ---
+	if not args.snapshot_dt >= 0:
+		raise SystemExit("-snapshot_dt must be >= 0 (got {0})".format(args.snapshot_dt))
+	if args.snapshot_dt > 0 and (args.JouleHeating or not args.ScattPower):
+		raise SystemExit("-snapshot_dt writes T/R tables: it needs -ScattPower and cannot be "
+			"combined with -JouleHeating")
+	# --- end spectrum snapshots (D1) ---
 	# Cheap argument checks, all before main() spends time building the simulation.
 	if args.Z2:
 		raise SystemExit("-Z2 is not implemented in this script; pass a -load file")
